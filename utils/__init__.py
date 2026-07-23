@@ -1,1 +1,0 @@
-# Image utility helpers

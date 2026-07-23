@@ -1,6 +1,13 @@
 paddleocr==2.7.3
-paddlepaddle==2.6.2
+paddlepaddle-gpu==2.6.2
+nvidia-cudnn-cu11==8.9.5.29
+nvidia-cublas-cu11==11.11.3.6
+nvidia-cuda-nvrtc-cu11==11.8.89
 opencv-python==4.6.0.66
 numpy==1.26.4
 pillow==12.3.0
 streamlit==1.59.2
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv

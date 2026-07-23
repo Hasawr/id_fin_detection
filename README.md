@@ -1,101 +1,161 @@
-# Azerbaijani ID Card FIN Code Detection & Extraction System
+# Multi-service OCR API
 
-An automated OCR-based detection and extraction pipeline for Personal Identification Numbers (FIN / JŞV) from Azerbaijani National ID cards and Passports using **PaddleOCR** and **OpenCV**.
+A FastAPI platform for exposing OCR engines as versioned third-party APIs.
+The first production route extracts FIN codes from Azerbaijani ID cards.
+Passport OCR is registered as a placeholder for the next service.
 
----
+## Services
 
-## 🚀 Features
+| Method | Route | API key | Status |
+| --- | --- | --- | --- |
+| `GET` | `/health` | No | Available |
+| `POST` | `/v1/id-fin` | Yes | Available |
+| `POST` | `/v1/id-fin/batch` | Yes | Multiple MRZ images |
+| `POST` | `/v1/passport` | Yes | Returns `501` until implemented |
+| `GET` | `/docs` | No | OpenAPI documentation |
 
-- **Dual Extraction Engine**:
-  - **VIZ (Visual Inspection Zone / Front Side)**: Detects FIN codes located under personal data fields using ROI extraction and pattern matching.
-  - **MRZ (Machine Readable Zone / Back Side)**: Extracts 3-line document MRZ data, validates document checksums, and parses the 7-character FIN code.
-- **Streamlit Web Application (`app.py`)**: Interactive UI for single-sided or dual-sided ID uploads with real-time confidence scores and visualization.
-- **Command Line Interface (`main.py`)**: Scriptable CLI supporting JSON and formatted text outputs with optional debug visualization saving.
-- **Checksum Verification**: Built-in verification algorithm for ICAO Doc 9303 MRZ format compliance.
+Inbound `/v1/*` calls are written locally for audit:
+- metadata and full JSON responses in `AUDIT_DB_PATH` (default `data/audit.db`)
+- uploaded images and request bodies in `AUDIT_PAYLOAD_DIR`
+  (default `data/audit_payloads`)
 
----
+Open the Streamlit **Integration Audit** page to inspect volume, outcomes,
+saved payloads, and response bodies.
 
-## 🛠️ Project Structure
+## Setup
+
+Python 3.10 or newer is required.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
+
+Replace the example value in `.env` with a long random key. Multiple keys may
+be configured as a comma-separated list:
+
+```dotenv
+API_KEYS=first-client-key,second-client-key
+```
+
+GPU acceleration is enabled by default with `USE_GPU=true`, and the project
+installs `paddlepaddle-gpu`. A compatible NVIDIA driver is required. The CLI
+also uses GPU by default; pass `--cpu` only for an explicit CPU run.
+
+Start the API from the repository root:
+
+```powershell
+python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+
+To start both the FastAPI backend and Streamlit frontend in separate windows,
+double-click `run.bat` or run:
+
+```powershell
+.\run.bat
+```
+
+The script works from any current directory, uses `.venv` when present,
+creates `.env` from the example when missing, and installs missing
+dependencies.
+
+PaddleOCR downloads its model files when the ID FIN service is used for the
+first time. The detector is then reused for later requests.
+
+## Call the ID FIN endpoint
+
+Upload the card side containing the MRZ using the required `mrz` field. This
+is the front side on older 2-line cards and the back side on new 3-line cards:
+
+```powershell
+curl.exe -X POST "http://localhost:8000/v1/id-fin" `
+  -H "X-API-Key: first-client-key" `
+  -F "mrz=@C:\images\id-back.jpg"
+```
+
+Successful responses use a stable service envelope:
+
+```json
+{
+  "service": "id-fin",
+  "version": "v1",
+  "data": {
+    "fin": "7ABC123",
+    "confidence": 0.96,
+    "mrz_details": {},
+    "notes": []
+  },
+  "error": null
+}
+```
+
+For multiple cards, repeat the `mrz` multipart field:
+
+```powershell
+curl.exe -X POST "http://localhost:8000/v1/id-fin/batch" `
+  -H "X-API-Key: first-client-key" `
+  -F "mrz=@C:\images\first-back.jpg" `
+  -F "mrz=@C:\images\second-back.jpg"
+```
+
+Batch responses contain `data.count` and an ordered `data.results` list. Each
+result includes `index`, `file_name`, `fin`, `confidence`, `mrz_details`, and
+`notes`. OCR runs sequentially on the shared GPU to avoid concurrent model
+access and GPU-memory spikes.
+
+Each image is limited by `MAX_UPLOAD_BYTES` (10 MiB by default) and
+`MAX_IMAGE_PIXELS` (25 megapixels by default). File signatures are verified
+before OCR. A batch accepts at most `MAX_BATCH_FILES` images (10 by default).
+Uploaded files are stored in a request-specific temporary directory and
+removed after processing.
+
+## Project structure
 
 ```text
-id_fin_detection/
-├── fin_detector/          # Core detection module
-│   ├── detector.py        # Main orchestrator (FINDetector)
-│   ├── mrz_extractor.py   # MRZ side parser & checksum validator
-│   ├── viz_extractor.py   # VIZ side ROI detection & regex parser
-│   ├── preprocessor.py    # Image enhancement & grayscale transformations
-│   └── validator.py       # Azerbaijani FIN validation logic
-├── utils/
-│   └── image_utils.py     # OpenCV drawing & visualization helpers
-├── app.py                 # Streamlit web user interface
-├── main.py                # Command Line Interface (CLI)
-├── test_logic.py          # Unit & logic test suite
-├── requirements.txt       # Python dependency file
-└── .gitignore             # Git ignore file
+api/                    FastAPI application, authentication, schemas, routes
+services/
+  id_fin/               Azerbaijani ID FIN OCR engine and service adapter
+  passport/             Passport service placeholder
+shared/                 Configuration and secure upload handling
+demos/
+  cli.py                Local command-line interface
+  streamlit_app.py      Internal Streamlit demo
+  pages/                Streamlit pages (Integration Audit)
+shared/audit.py         SQLite audit store for third-party API calls
+tests/                  Logic and HTTP contract tests
 ```
 
----
+The HTTP route handles transport and validation. Each package under
+`services/` owns its OCR implementation. `IDFinService` serializes the OCR
+result and runs the blocking detector in a worker thread with a lock around
+the shared PaddleOCR instance.
 
-## 📦 Installation & Setup
+## Add another OCR service
 
-1. **Clone the Repository**:
-   ```bash
-   git clone https://github.com/<YOUR_USERNAME>/id_fin_detection.git
-   cd id_fin_detection
-   ```
+1. Create a package under `services/<service_name>/`.
+2. Add a service adapter with an async `process` method.
+3. Add its versioned router under `api/routes/`.
+4. Include the router in `api/main.py` and list it in `/health`.
+5. Add API contract and engine tests.
 
-2. **Create a Virtual Environment**:
-   ```bash
-   python -m venv venv
-   # On Windows (PowerShell):
-   .\venv\Scripts\Activate.ps1
-   # On Linux / macOS:
-   source venv/bin/activate
-   ```
+## Local tools
 
-3. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
----
-
-## 💻 Usage
-
-### 1. Streamlit Web App
-Launch the interactive web application in your browser:
-```bash
-streamlit run app.py
+```powershell
+python demos\cli.py --mrz C:\images\first-back.jpg C:\images\second-back.jpg --output json
+streamlit run demos\streamlit_app.py
 ```
 
-### 2. Command Line Interface (CLI)
-Run detection directly from the command line:
+In Streamlit, use the sidebar page **Integration Audit** to inspect third-party
+API traffic recorded while the FastAPI backend is running.
 
-- **Both Sides (Front & Back)**:
-  ```bash
-  python main.py --viz images/front.png --mrz images/back.png --output json
-  ```
+## Tests
 
-- **Front Side Only**:
-  ```bash
-  python main.py --viz images/front.png --debug
-  ```
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
 
-- **Back Side Only**:
-  ```bash
-  python main.py --mrz images/back.png
-  ```
-
----
-
-## 🛡️ Recommended Best Practices & Privacy
-
-- **Sensitive Data**: Avoid committing real ID cards or personal documents containing PII (Personally Identifiable Information) to public repositories.
-- **Debug Files**: Output files in `debug_output/` and `documents/` are ignored by `.gitignore` by default.
-- **Git Ignore**: Virtual environments (`venv/`), IDE config files (`.idea/`, `.vscode/`), and temporary images are untracked.
-
----
-
-## 📄 License
-
-Distributed under the MIT License.
+The API tests replace the OCR engine with a fake service, so they do not load
+PaddleOCR models or require real identity documents.

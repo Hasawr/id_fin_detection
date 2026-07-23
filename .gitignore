@@ -1,39 +1,23 @@
-# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
 
-# Virtual environments
+.venv/
 venv/
 env/
-ENV/
-.venv/
 
-# IDEs and Code Editors
-.idea/
-.vscode/
-*.swp
-*.swo
-*.sublime-project
-*.sublime-workspace
-
-# Environment variables and secrets
 .env
 .env.*
 !.env.example
 secrets.json
 
-# Project specific local test files & debug outputs (Privacy & Storage)
 debug_output/
 documents/
-images/*
-!images/.gitkeep
+data/
+*.log
 
-# Operating System files
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Logs
-*.log
-logs/
