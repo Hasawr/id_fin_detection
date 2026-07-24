@@ -20,7 +20,8 @@ st.caption(
     "Open **Integration Audit** in the sidebar to inspect third-party API traffic."
 )
 
-RESULT_SCHEMA_VERSION = 2
+# Increment when cached detector/result objects become incompatible.
+RESULT_SCHEMA_VERSION = 8
 
 
 @st.cache_resource
@@ -142,7 +143,12 @@ if detected_results:
                 if result.fin:
                     st.success("MRZ and FIN detected")
                 else:
-                    st.error("MRZ or FIN was not detected")
+                    failure_message = (
+                        result.notes[-1]
+                        if result.notes
+                        else "MRZ or FIN was not detected."
+                    )
+                    st.error(failure_message)
 
                 st.metric("FIN", result.fin or "Not found")
                 st.caption(f"Confidence: {result.confidence:.2%}")
@@ -156,11 +162,7 @@ if detected_results:
                     else:
                         st.warning("Card type: Unknown")
 
-                    card_serial_number = getattr(
-                        mrz_result,
-                        "card_serial_number",
-                        None,
-                    )
+                    card_serial_number = mrz_result.card_serial_number
                     if card_serial_number:
                         st.metric(
                             "Card serial number",

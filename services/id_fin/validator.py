@@ -8,10 +8,6 @@ def is_valid_fin(fin: str) -> bool:
     return bool(fin and FIN_PATTERN.match(fin))
 
 
-def clean_ocr_text(text: str) -> str:
-    return text.strip().upper() if text else ""
-
-
 def clean_mrz_line(text: str) -> str:
     if not text:
         return ""

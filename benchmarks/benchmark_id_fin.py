@@ -1,4 +1,5 @@
 import argparse
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -104,8 +105,17 @@ def benchmark() -> tuple[dict[str, Any], int]:
         warm_timings: list[float] = []
         case_results: list[dict[str, Any]] = []
         fallback_count = 0
+        method_counts: Counter[str] = Counter()
         case_accuracy = {
-            case["id"]: {"fin_matches": True, "card_type_matches": True}
+            case["id"]: {
+                "fin_matches": True,
+                "card_type_matches": True,
+                **(
+                    {"serial_matches": True}
+                    if "expected_serial_sha256" in case
+                    else {}
+                ),
+            }
             for case in cases
         }
         total_inferences = 0
@@ -125,8 +135,9 @@ def benchmark() -> tuple[dict[str, Any], int]:
                     if result.mrz_result is not None
                     else "not_found"
                 )
-                did_fallback = any(
-                    "fell back to full image" in note for note in result.notes
+                method_counts[method] += 1
+                did_fallback = not method.endswith(
+                    ("mrz_strip", "mrz_roi")
                 )
                 if did_fallback:
                     fallback_count += 1
@@ -145,6 +156,16 @@ def benchmark() -> tuple[dict[str, Any], int]:
                 case_accuracy[case["id"]][
                     "card_type_matches"
                 ] &= card_type_matches
+                if "expected_serial_sha256" in case:
+                    serial_number = (
+                        result.mrz_result.card_serial_number
+                        if result.mrz_result is not None
+                        else None
+                    )
+                    case_accuracy[case["id"]]["serial_matches"] &= (
+                        hash_fin(serial_number)
+                        == case["expected_serial_sha256"]
+                    )
 
                 if run_index == arguments.runs - 1:
                     case_results.append(
@@ -157,7 +178,11 @@ def benchmark() -> tuple[dict[str, Any], int]:
                     )
 
     all_accurate = all(
-        case["fin_matches"] and case["card_type_matches"]
+        all(
+            value
+            for key, value in case.items()
+            if key.endswith("_matches")
+        )
         for case in case_results
     )
     warm_total = sum(warm_timings)
@@ -182,6 +207,7 @@ def benchmark() -> tuple[dict[str, Any], int]:
         "full_image_fallback_rate": round(
             fallback_count / total_inferences, 4
         ),
+        "method_counts": dict(sorted(method_counts.items())),
         "all_expected_results_match": all_accurate,
         "cases": case_results,
     }

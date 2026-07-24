@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from importlib import import_module
 import logging
 import os
 from pathlib import Path
+from typing import Callable
 
 from . import FINDetectionOutput
 from .image_utils import draw_mrz_debug, save_debug_image
@@ -11,6 +13,13 @@ from .preprocessor import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
 _DLL_DIRECTORY_HANDLES: list[object] = []
+
+
+@dataclass(frozen=True)
+class OCRAttempt:
+    name: str
+    image_factory: Callable[[], object | None]
+    is_cropped: bool
 
 
 def configure_nvidia_dll_directories() -> None:
@@ -78,22 +87,40 @@ class FINDetector:
                 if rectified is image
                 else "Card ROI successfully detected and rectified."
             )
-            enhanced = self.preprocessor.bound_ocr_input(
-                self.preprocessor.enhance_for_mrz(rectified),
-                self.max_ocr_side,
-            )
-            mrz_result = self.mrz_extractor.extract(enhanced, is_cropped=True)
-            if not self.mrz_extractor.is_structurally_valid(mrz_result):
-                mrz_result = self.mrz_extractor.extract(
-                    self.preprocessor.bound_ocr_input(
-                        rectified,
-                        self.max_ocr_side,
-                    ),
-                    is_cropped=False,
+            attempts = self._build_attempts(rectified)
+            attempted_results = []
+            mrz_result = None
+            for attempt in attempts:
+                attempt_image = attempt.image_factory()
+                if attempt_image is None:
+                    continue
+                attempted_result = self.mrz_extractor.extract(
+                    attempt_image,
+                    is_cropped=attempt.is_cropped,
+                    attempt=attempt.name,
                 )
-                notes.append("FIN extraction fell back to full image scan.")
+                attempted_results.append(attempted_result)
+                if self.mrz_extractor.is_structurally_valid(
+                    attempted_result
+                ):
+                    mrz_result = attempted_result
+                    notes.append(
+                        f"FIN extracted using {attempt.name}."
+                    )
+                    break
             else:
-                notes.append("FIN successfully extracted from cropped MRZ band.")
+                if attempted_results:
+                    mrz_result = max(
+                        attempted_results,
+                        key=lambda result: result.confidence,
+                    )
+                notes.append(
+                    "MRZ region was not reliably detected, or OCR output "
+                    "did not contain a valid TD1/TD2 structure."
+                )
+
+            if mrz_result is None:
+                raise RuntimeError("OCR attempt pipeline produced no result.")
 
             if self.debug:
                 annotated = draw_mrz_debug(
@@ -118,3 +145,82 @@ class FINDetector:
                 confidence=0.0,
                 notes=["Failed to process MRZ image."],
             )
+
+    def _build_attempts(self, rectified) -> list[OCRAttempt]:
+        deskewed_cache: dict[str, object] = {}
+
+        def get_mrz_roi(source):
+            mrz_roi = self.preprocessor.detect_mrz_roi(source)
+            if mrz_roi is None:
+                return None
+            return self.preprocessor.bound_ocr_input(
+                self.preprocessor.enhance_mrz_image(mrz_roi),
+                self.max_ocr_side,
+            )
+
+        def get_deskewed():
+            if "image" not in deskewed_cache:
+                deskewed_cache["image"] = self.preprocessor.deskew(rectified)
+            deskewed = deskewed_cache["image"]
+            return None if deskewed is rectified else deskewed
+
+        def get_deskewed_strip():
+            deskewed = get_deskewed()
+            if deskewed is None:
+                return None
+            return self.preprocessor.bound_ocr_input(
+                self.preprocessor.enhance_for_mrz(deskewed),
+                self.max_ocr_side,
+            )
+
+        def get_deskewed_mrz_roi():
+            deskewed = get_deskewed()
+            return None if deskewed is None else get_mrz_roi(deskewed)
+
+        def get_deskewed_full():
+            deskewed = get_deskewed()
+            if deskewed is None:
+                return None
+            return self.preprocessor.bound_ocr_input(
+                deskewed,
+                self.max_ocr_side,
+            )
+
+        return [
+            OCRAttempt(
+                name="mrz_strip",
+                image_factory=lambda: self.preprocessor.bound_ocr_input(
+                    self.preprocessor.enhance_for_mrz(rectified),
+                    self.max_ocr_side,
+                ),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="mrz_roi",
+                image_factory=lambda: get_mrz_roi(rectified),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="deskewed_mrz_roi",
+                image_factory=get_deskewed_mrz_roi,
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="deskewed_mrz_strip",
+                image_factory=get_deskewed_strip,
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="full_image",
+                image_factory=lambda: self.preprocessor.bound_ocr_input(
+                    rectified,
+                    self.max_ocr_side,
+                ),
+                is_cropped=False,
+            ),
+            OCRAttempt(
+                name="deskewed_full_image",
+                image_factory=get_deskewed_full,
+                is_cropped=False,
+            ),
+        ]

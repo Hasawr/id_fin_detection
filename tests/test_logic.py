@@ -3,8 +3,9 @@ import numpy as np
 
 from benchmarks.benchmark_id_fin import warm_latency_improvement
 from services.id_fin import FINDetectionOutput, MRZResult
+from services.id_fin.detector import FINDetector
 from services.id_fin.preprocessor import ImagePreprocessor
-from services.id_fin.service import IDFinService
+from services.id_fin.service import serialize_fin_detection
 from services.id_fin.validator import (
     clean_mrz_line,
     compute_mrz_check_digit,
@@ -95,6 +96,7 @@ def test_truncated_old_card_is_not_classified_as_new() -> None:
     assert old_result.card_type == "older_card"
     assert old_result.fin is None
     assert fallback_result.card_type == "unknown"
+    assert fallback_result.fin is None
 
 
 def test_localized_card_uses_bottom_35_percent_for_mrz() -> None:
@@ -118,6 +120,39 @@ def test_conservative_card_localization_and_input_cap() -> None:
     assert 1.4 < localized.shape[1] / localized.shape[0] < 1.8
     assert max(bounded.shape[:2]) == 500
     assert bounded.shape[1] / bounded.shape[0] == photo.shape[1] / photo.shape[0]
+
+
+def test_mrz_roi_localizes_wide_text_block() -> None:
+    card = np.full((500, 800, 3), 245, dtype=np.uint8)
+    for index, text in enumerate(
+        (
+            "IAAZEAA12345670AZE1ABC234<<<<<",
+            "9001011M3001019AZE<<<<<<<<<<<0",
+            "TEST<<PERSON<<<<<<<<<<<<<<<<<<",
+        )
+    ):
+        cv2.putText(
+            card,
+            text,
+            (60, 360 + index * 45),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (10, 10, 10),
+            2,
+            cv2.LINE_AA,
+        )
+
+    mrz_roi = ImagePreprocessor.detect_mrz_roi(card)
+
+    assert mrz_roi is not None
+    assert mrz_roi.shape[0] < card.shape[0] * 0.6
+    assert mrz_roi.shape[1] > card.shape[1] * 0.5
+
+
+def test_mrz_roi_returns_none_without_text_structure() -> None:
+    blank = np.full((500, 800, 3), 245, dtype=np.uint8)
+
+    assert ImagePreprocessor.detect_mrz_roi(blank) is None
 
 
 def test_structural_validation_rejects_truncated_td2() -> None:
@@ -173,6 +208,126 @@ def test_new_card_serial_number_requires_aa_or_ab_and_seven_digits() -> None:
         )
         is None
     )
+
+
+def test_new_card_classification_tolerates_minor_header_ocr_loss() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td1(
+        [
+            ("IAAEAA123456701ABC234<<<<<<", 0.93),
+            ("9001011M3001019A2E<<<<<<<<<<<0", 0.91),
+            ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
+        ],
+        is_cropped=False,
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number == "AA1234567"
+
+
+def test_valid_td1_fin_does_not_require_perfect_serial_ocr() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td1(
+        [
+            ("IAAZEAA123O5670AZE1ABC234<<<<<", 0.90),
+            ("9001011M3001019AZE<<<<<<<<<<<0", 0.91),
+            ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
+        ],
+        is_cropped=False,
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number is None
+
+
+def test_valid_td1_tolerates_digit_confusion_in_second_line() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td1(
+        [
+            ("IAAZEAA12345670AZE1ABC234<<<<<", 0.90),
+            ("9O01011M3O01019AZE<<<<<<<<<<<0", 0.91),
+            ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
+        ],
+        is_cropped=False,
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number == "AA1234567"
+
+
+def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    merged_lines = [
+        ("14<05<1978<<<<<<<<<<<<<<<<<<<<", 0.97),
+        ("GOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.96),
+        ("19205792<7AZE8210276M32102712BDLLON5", 0.98),
+    ]
+
+    pair = extractor._find_td2_pair(merged_lines)
+
+    assert pair is not None
+    result = extractor._parse_td2(pair, is_cropped=False)
+    assert result.fin == "2BDLLON"
+    assert result.card_type == "older_card"
+
+
+def test_strong_td1_candidate_beats_weak_headerless_td2_candidate() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    merged_lines = [
+        ("NOISY<<NAME<<<<<<<<<<<<<<<<<<<<", 0.70),
+        ("19205792<0AZE8210276M32102712BDLLON5", 0.70),
+        ("IAAZEAA12345670AZE1ABC234<<<<<", 0.97),
+        ("9001011M3001019AZE<<<<<<<<<<<0", 0.97),
+        ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.97),
+    ]
+
+    result = extractor._select_best_result(
+        merged_lines,
+        "full_image",
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.method == "td1_full_image"
+
+
+def test_invalid_td2_candidate_does_not_block_valid_td1() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    merged_lines = [
+        ("I<AZEOLD<<CARD<<<<<<<<<<<<<<<<<<<<", 0.85),
+        ("19205792<7AZE8210276M3210271SHORT", 0.85),
+        ("IAAZEAA12345670AZE1ABC234<<<<<", 0.96),
+        ("9001011M3001019AZE<<<<<<<<<<<0", 0.96),
+        ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.96),
+    ]
+
+    result = extractor._select_best_result(
+        merged_lines,
+        "full_image",
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+
+
+def test_unknown_td1_layout_does_not_return_label_as_fin() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td1(
+        [
+            ("A<II<RH<QAN<QRUPU<BLOOD<GROU<<", 0.84),
+            ("IAAZEAA12345670AZE1ABC234<<<<<", 0.93),
+            ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
+        ],
+        is_cropped=False,
+    )
+
+    assert result.card_type == "unknown"
+    assert result.fin is None
+    assert result.card_serial_number is None
+    assert result.checksum_valid is False
 
 
 def test_td1_selection_ignores_interleaved_non_mrz_text() -> None:
@@ -260,7 +415,7 @@ def test_service_serializes_card_serial_number() -> None:
         card_serial_number="AA1234567",
     )
 
-    serialized = IDFinService._serialize(
+    serialized = serialize_fin_detection(
         FINDetectionOutput(
             fin="1ABC234",
             confidence=0.95,
@@ -271,6 +426,91 @@ def test_service_serializes_card_serial_number() -> None:
     mrz_details = serialized["mrz_details"]
     assert isinstance(mrz_details, dict)
     assert mrz_details["card_serial_number"] == "AA1234567"
+
+
+def test_detector_uses_deskew_only_after_regular_fallback_fails() -> None:
+    original = np.zeros((100, 200, 3), dtype=np.uint8)
+    deskewed = np.ones((100, 200, 3), dtype=np.uint8)
+    attempted_names: list[str | None] = []
+
+    class FakePreprocessor:
+        @staticmethod
+        def load(_path) -> np.ndarray:
+            return original
+
+        @staticmethod
+        def detect_card_roi(image: np.ndarray) -> np.ndarray:
+            return image
+
+        @staticmethod
+        def enhance_for_mrz(image: np.ndarray) -> np.ndarray:
+            return image[:35]
+
+        @staticmethod
+        def detect_mrz_roi(_image: np.ndarray) -> None:
+            return None
+
+        @staticmethod
+        def enhance_mrz_image(image: np.ndarray) -> np.ndarray:
+            return image
+
+        @staticmethod
+        def bound_ocr_input(
+            image: np.ndarray,
+            _max_side: int,
+        ) -> np.ndarray:
+            return image
+
+        @staticmethod
+        def deskew(_image: np.ndarray) -> np.ndarray:
+            return deskewed
+
+    class FakeExtractor:
+        @staticmethod
+        def extract(
+            image: np.ndarray,
+            is_cropped: bool,
+            attempt: str | None = None,
+        ) -> MRZResult:
+            attempted_names.append(attempt)
+            is_valid = image is deskewed and not is_cropped
+            return MRZResult(
+                fin="1ABC234" if is_valid else None,
+                confidence=0.95 if is_valid else 0.0,
+                line1="IAAZEAA12345670AZE1ABC234<<<<<" if is_valid else "",
+                line2="9001011M3001019AZE<<<<<<<<<<<0" if is_valid else "",
+                line3="TEST<<PERSON<<<<<<<<<<<<<<<<<<" if is_valid else "",
+                checksum_valid=is_valid,
+                method=f"td1_{attempt}" if is_valid else "not_found",
+                card_type="new_card" if is_valid else "unknown",
+                card_serial_number="AA1234567" if is_valid else None,
+            )
+
+        @staticmethod
+        def is_structurally_valid(result: MRZResult) -> bool:
+            return result.fin is not None
+
+    detector = FINDetector.__new__(FINDetector)
+    detector.preprocessor = FakePreprocessor()
+    detector.mrz_extractor = FakeExtractor()
+    detector.max_ocr_side = 1600
+    detector.debug = False
+
+    result = detector.detect_from_mrz("tilted-card.png")
+
+    assert result.fin == "1ABC234"
+    assert result.mrz_result is not None
+    assert result.mrz_result.method == "td1_deskewed_full_image"
+    assert (
+        "FIN extracted using deskewed_full_image."
+        in result.notes
+    )
+    assert attempted_names == [
+        "mrz_strip",
+        "deskewed_mrz_strip",
+        "full_image",
+        "deskewed_full_image",
+    ]
 
 
 def test_warm_latency_gate_requires_20_percent_improvement() -> None:

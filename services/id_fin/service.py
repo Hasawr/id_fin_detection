@@ -10,6 +10,15 @@ from services.id_fin import FINDetectionOutput
 from services.id_fin.detector import FINDetector
 
 
+def serialize_fin_detection(
+    result: FINDetectionOutput,
+) -> dict[str, object]:
+    data = asdict(result)
+    data["confidence"] = round(float(result.confidence), 4)
+    data["mrz_details"] = data.pop("mrz_result")
+    return data
+
+
 class IDFinService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -35,19 +44,13 @@ class IDFinService:
         def run_detection() -> list[dict[str, object]]:
             with self._inference_lock:
                 return [
-                    self._serialize(self._detector.detect_from_mrz(image_path))
+                    serialize_fin_detection(
+                        self._detector.detect_from_mrz(image_path)
+                    )
                     for image_path in image_paths
                 ]
 
         return await run_in_threadpool(run_detection)
-
-    @staticmethod
-    def _serialize(result: FINDetectionOutput) -> dict[str, object]:
-        data = asdict(result)
-        data["confidence"] = round(float(result.confidence), 4)
-        data["mrz_details"] = data.pop("mrz_result")
-        return data
-
 
 @lru_cache(maxsize=1)
 def get_id_fin_service() -> IDFinService:

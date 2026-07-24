@@ -188,12 +188,23 @@ python benchmarks\benchmark_id_fin.py `
 
 On Windows 11, Python 3.12.10, PaddlePaddle GPU 2.6.2, CUDA 11.8, cuDNN 8.6,
 and an NVIDIA GeForce RTX 4060 Laptop GPU, the two-card TD1/TD2 fixture set
-improved from 170.9 ms to 57.6 ms warm median latency. Throughput increased
-from 5.89 to 17.32 images/s, full-image fallback fell from 50% to 0%, and all
+improved from 170.9 ms to 126.2 ms warm median latency. Throughput increased
+from 5.89 to 8.05 images/s, full-image fallback fell from 50% to 0%, and all
 expected FIN/card-type results remained unchanged.
 
-The optimized pipeline localizes the card, OCRs its bottom 35% MRZ candidate,
-falls back to bounded full-card OCR only when the first result is not
-structurally valid, caps OCR inputs at 1600 pixels, and retains Paddle's
-measured 960-pixel detection-side limit. See `benchmarks/README.md` for the
-methodology and limitations.
+The optimized pipeline localizes the card and tries lazy attempts in order:
+cleaned bottom strip, detected MRZ rectangle, deskewed MRZ rectangle,
+deskewed strip, bounded full card, and deskewed bounded full card. It stops at
+the first structurally accepted result, so successful fast-path cards do not
+pay for MRZ localization, deskew, or full-image OCR.
+
+TD1 and TD2 candidates are evaluated together rather than letting one format
+block the other. Candidate scoring uses MRZ structure, line lengths, OCR
+confidence, nationality position, and checksum quality; checksum is a quality
+signal rather than a hard rejection because a single OCR error can invalidate
+it while leaving the FIN readable. FIN values are accepted only from the
+selected format's defined field. Card serial extraction remains optional.
+
+OCR inputs are capped at 1600 pixels and Paddle retains the measured
+960-pixel detection-side limit. See `benchmarks/README.md` for methodology,
+private-fixture rules, method counts, and limitations.

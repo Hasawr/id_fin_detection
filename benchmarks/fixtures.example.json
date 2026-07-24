@@ -4,7 +4,8 @@
       "id": "new-card-sample",
       "path": "C:/private-fixtures/new-card.jpg",
       "expected_card_type": "new_card",
-      "expected_fin_sha256": "replace-with-sha256-of-expected-fin"
+      "expected_fin_sha256": "replace-with-sha256-of-expected-fin",
+      "expected_serial_sha256": "optional-sha256-of-expected-card-serial"
     },
     {
       "id": "older-card-sample",

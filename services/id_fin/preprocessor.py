@@ -45,11 +45,139 @@ class ImagePreprocessor:
             int(height * (1.0 - cls.MRZ_HEIGHT_RATIO)) : height,
             0:width,
         ]
-        gray = cv2.cvtColor(mrz_crop, cv2.COLOR_BGR2GRAY)
+        return cls.enhance_mrz_image(mrz_crop)
+
+    @staticmethod
+    def enhance_mrz_image(image: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         enhanced = cv2.createCLAHE(
             clipLimit=3.0, tileGridSize=(8, 8)
         ).apply(gray)
         return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    @classmethod
+    def detect_mrz_roi(cls, image: np.ndarray) -> np.ndarray | None:
+        height, width = image.shape[:2]
+        if height < 60 or width < 120:
+            return None
+
+        scale = min(1.0, 1000 / width)
+        resized = cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+        kernel_width = max(15, round(resized.shape[1] * 0.035))
+        if kernel_width % 2 == 0:
+            kernel_width += 1
+        blackhat_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (kernel_width, 5),
+        )
+        blackhat = cv2.morphologyEx(
+            gray,
+            cv2.MORPH_BLACKHAT,
+            blackhat_kernel,
+        )
+        gradient = cv2.Sobel(
+            blackhat,
+            ddepth=cv2.CV_32F,
+            dx=1,
+            dy=0,
+            ksize=-1,
+        )
+        gradient = np.absolute(gradient)
+        minimum, maximum = gradient.min(), gradient.max()
+        if maximum <= minimum:
+            return None
+        gradient = (
+            255 * (gradient - minimum) / (maximum - minimum)
+        ).astype("uint8")
+
+        horizontal_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (kernel_width, 5),
+        )
+        connected = cv2.morphologyEx(
+            gradient,
+            cv2.MORPH_CLOSE,
+            horizontal_kernel,
+        )
+        _, threshold = cv2.threshold(
+            connected,
+            0,
+            255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+        )
+        vertical_kernel = cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (9, max(9, round(resized.shape[0] * 0.045))),
+        )
+        threshold = cv2.morphologyEx(
+            threshold,
+            cv2.MORPH_CLOSE,
+            vertical_kernel,
+        )
+
+        contours, _ = cv2.findContours(
+            threshold,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        candidates: list[tuple[float, tuple[int, int, int, int]]] = []
+        resized_height, resized_width = resized.shape[:2]
+        for contour in contours:
+            x, y, candidate_width, candidate_height = cv2.boundingRect(
+                contour
+            )
+            if candidate_height <= 0:
+                continue
+            width_ratio = candidate_width / resized_width
+            aspect_ratio = candidate_width / candidate_height
+            bottom_position = (y + candidate_height) / resized_height
+            if (
+                width_ratio < 0.35
+                or aspect_ratio < 2.5
+                or bottom_position < 0.55
+            ):
+                continue
+            score = (
+                width_ratio * 3
+                + min(aspect_ratio, 10) / 10
+                + bottom_position
+            )
+            candidates.append(
+                (
+                    score,
+                    (x, y, candidate_width, candidate_height),
+                )
+            )
+
+        if not candidates:
+            return None
+        _, (x, y, candidate_width, candidate_height) = max(
+            candidates,
+            key=lambda candidate: candidate[0],
+        )
+        padding_x = round(candidate_width * 0.04)
+        padding_y = max(
+            round(candidate_height * 0.65),
+            round(resized_height * 0.025),
+        )
+        x1 = max(0, x - padding_x)
+        y1 = max(0, y - padding_y)
+        x2 = min(resized_width, x + candidate_width + padding_x)
+        y2 = min(resized_height, y + candidate_height + padding_y)
+
+        original_x1 = max(0, round(x1 / scale))
+        original_y1 = max(0, round(y1 / scale))
+        original_x2 = min(width, round(x2 / scale))
+        original_y2 = min(height, round(y2 / scale))
+        mrz_roi = image[original_y1:original_y2, original_x1:original_x2]
+        return mrz_roi if mrz_roi.size else None
 
     @staticmethod
     def bound_ocr_input(

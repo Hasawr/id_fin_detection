@@ -1,5 +1,4 @@
 import argparse
-from dataclasses import asdict
 import json
 from pathlib import Path
 import sys
@@ -10,6 +9,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.id_fin.detector import FINDetector
+from services.id_fin.service import serialize_fin_detection
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -39,7 +39,10 @@ def main() -> None:
 
     if arguments.output == "json":
         payload = [
-            {"file_name": image_path.name, **asdict(result)}
+            {
+                "file_name": image_path.name,
+                **serialize_fin_detection(result),
+            }
             for image_path, result in results
         ]
         print(json.dumps(payload, indent=2))

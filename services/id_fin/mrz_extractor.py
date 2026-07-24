@@ -1,19 +1,32 @@
+from dataclasses import dataclass
 import logging
 import re
 
 from . import MRZResult
-from .validator import clean_mrz_line, compute_mrz_check_digit
+from .validator import clean_mrz_line, compute_mrz_check_digit, is_valid_fin
 
 
 logger = logging.getLogger(__name__)
 MRZ_LINE_MIN_LENGTH = 10
 
 
+@dataclass(frozen=True)
+class MRZCandidate:
+    format_name: str
+    lines: tuple[tuple[str, float], ...]
+    score: float
+
+
 class MRZExtractor:
     def __init__(self, ocr_engine):
         self.ocr = ocr_engine
 
-    def extract(self, image, is_cropped: bool = False) -> MRZResult:
+    def extract(
+        self,
+        image,
+        is_cropped: bool = False,
+        attempt: str | None = None,
+    ) -> MRZResult:
         try:
             ocr_results = self.ocr.ocr(image, det=True, rec=True, cls=False)
         except Exception:
@@ -41,6 +54,14 @@ class MRZExtractor:
         if not blocks:
             return self._not_found()
 
+        merged_lines = self._merge_blocks(blocks)
+        attempt_name = attempt or (
+            "mrz_strip" if is_cropped else "full_image"
+        )
+        return self._select_best_result(merged_lines, attempt_name)
+
+    @staticmethod
+    def _merge_blocks(blocks: list[dict]) -> list[tuple[str, float]]:
         blocks.sort(key=lambda block: block["cy"])
         average_height = sum(
             max(point[1] for point in block["bbox"])
@@ -73,54 +94,171 @@ class MRZExtractor:
             confidence = sum(block["confidence"] for block in group) / len(group)
             if len(text) >= MRZ_LINE_MIN_LENGTH:
                 merged_lines.append((text, confidence))
-        td2_pair = self._find_td2_pair(merged_lines)
-        if td2_pair is not None:
-            return self._parse_td2(td2_pair, is_cropped)
-        return self._parse_td1(merged_lines, is_cropped)
+        return merged_lines
 
-    @staticmethod
+    def _select_best_result(
+        self,
+        merged_lines: list[tuple[str, float]],
+        attempt: str,
+    ) -> MRZResult:
+        candidates = [
+            *self._find_td1_candidates(merged_lines),
+            *self._find_td2_candidates(merged_lines),
+        ]
+        if not candidates:
+            return self._diagnostic_result(merged_lines)
+
+        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        for candidate in candidates:
+            if candidate.format_name == "td1":
+                result = self._parse_td1_lines(
+                    list(candidate.lines),
+                    attempt,
+                )
+            else:
+                result = self._parse_td2_lines(
+                    (candidate.lines[0], candidate.lines[1]),
+                    attempt,
+                )
+            if self.is_structurally_valid(result):
+                return result
+        return self._diagnostic_result(merged_lines)
+
+    @classmethod
     def _find_td2_pair(
+        cls,
         merged_lines: list[tuple[str, float]],
     ) -> tuple[tuple[str, float], tuple[str, float]] | None:
+        candidates = cls._find_td2_candidates(merged_lines)
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda candidate: candidate.score)
+        return best.lines[0], best.lines[1]
+
+    @classmethod
+    def _find_td2_candidates(
+        cls,
+        merged_lines: list[tuple[str, float]],
+    ) -> list[MRZCandidate]:
+        candidates: list[MRZCandidate] = []
+        seen: set[tuple[str, str]] = set()
         for first_index in range(len(merged_lines) - 2, -1, -1):
             first = merged_lines[first_index][0]
-            if not MRZExtractor._has_document_header(first):
+            if not cls._has_document_header(first):
                 continue
             for second_index in range(first_index + 1, len(merged_lines)):
                 second = merged_lines[second_index][0]
-                nationality_index = second.find("AZE", 8, 15)
-                birth_date = (
-                    second[nationality_index + 3 : nationality_index + 9]
-                    if nationality_index >= 0
-                    else ""
-                )
-                if (
-                    nationality_index in {9, 10, 11}
-                    and birth_date.isdigit()
-                    and len(second) >= 25
-                ):
-                    return (
+                if cls._looks_like_td2_second_line(second):
+                    pair = (
                         merged_lines[first_index],
                         merged_lines[second_index],
                     )
-        return None
+                    key = (pair[0][0], pair[1][0])
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(
+                            MRZCandidate(
+                                "td2",
+                                pair,
+                                cls._score_td2_candidate(pair, True),
+                            )
+                        )
+        for second_index in range(1, len(merged_lines)):
+            second = merged_lines[second_index][0]
+            if (
+                not cls._looks_like_td2_second_line(second)
+                or len(second) < 35
+                or not is_valid_fin(
+                    cls._normalize_length(second, 36)[28:35]
+                )
+            ):
+                continue
+            first = merged_lines[second_index - 1][0]
+            if len(first) >= 20 and "<<" in first:
+                pair = (
+                    merged_lines[second_index - 1],
+                    merged_lines[second_index],
+                )
+                key = (pair[0][0], pair[1][0])
+                if key not in seen:
+                    seen.add(key)
+                    candidates.append(
+                        MRZCandidate(
+                            "td2",
+                            pair,
+                            cls._score_td2_candidate(pair, False),
+                        )
+                    )
+        return candidates
+
+    @classmethod
+    def _score_td2_candidate(
+        cls,
+        pair: tuple[tuple[str, float], tuple[str, float]],
+        has_header: bool,
+    ) -> float:
+        (line1, confidence1), (line2, confidence2) = pair
+        normalized = cls._normalize_length(line2, 36)
+        checksum_valid = (
+            normalized[9].isdigit()
+            and compute_mrz_check_digit(normalized[:9])
+            == int(normalized[9])
+        )
+        fin_valid = is_valid_fin(normalized[28:35])
+        return (
+            (30 if has_header else 10)
+            + min(len(line1), 36) / 3
+            + min(len(line2), 36) / 2
+            + (20 if cls._looks_like_td2_second_line(line2) else 0)
+            + (25 if checksum_valid else 0)
+            + (30 if fin_valid else 0)
+            + ((confidence1 + confidence2) / 2) * 20
+        )
+
+    @staticmethod
+    def _looks_like_td2_second_line(line: str) -> bool:
+        nationality_index = line.find("AZE", 8, 15)
+        birth_date = (
+            line[nationality_index + 3 : nationality_index + 9]
+            if nationality_index >= 0
+            else ""
+        )
+        return (
+            nationality_index in {9, 10, 11}
+            and birth_date.isdigit()
+            and len(line) >= 25
+        )
 
     @staticmethod
     def _has_document_header(line: str) -> bool:
         return bool(re.match(r"^I(?:<|A)?AZE", line))
 
-    @staticmethod
-    def _looks_like_td1(lines: list[tuple[str, float]]) -> bool:
+    @classmethod
+    def _has_td1_document_header(cls, line: str) -> bool:
+        serial_match = re.search(r"A[AB]\d{7}", line[:16])
+        return cls._has_document_header(line) or (
+            line.startswith("I")
+            and serial_match is not None
+            and serial_match.start() in {4, 5, 6}
+        )
+
+    @classmethod
+    def _looks_like_td1(cls, lines: list[tuple[str, float]]) -> bool:
         if len(lines) != 3:
             return False
         first, second, third = (line_text for line_text, _ in lines)
-        nationality_index = second.find("AZE", 13, 20)
         return (
-            MRZExtractor._has_document_header(first)
-            and nationality_index in {14, 15, 16}
-            and second[:6].isdigit()
+            cls._has_td1_document_header(first)
+            and cls._looks_like_td1_second_line(second)
             and bool(third.rstrip("<"))
             and "<<" in third
+        )
+
+    @staticmethod
+    def _looks_like_td1_second_line(line: str) -> bool:
+        return (
+            len(line) >= 20
+            and sum(character.isdigit() for character in line[:20]) >= 8
         )
 
     @classmethod
@@ -128,27 +266,81 @@ class MRZExtractor:
         cls,
         merged_lines: list[tuple[str, float]],
     ) -> list[tuple[str, float]] | None:
+        candidates = cls._find_td1_candidates(merged_lines)
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda candidate: candidate.score)
+        return list(best.lines)
+
+    @classmethod
+    def _find_td1_candidates(
+        cls,
+        merged_lines: list[tuple[str, float]],
+    ) -> list[MRZCandidate]:
+        candidates: list[MRZCandidate] = []
         for first_index, first in enumerate(merged_lines):
-            if not cls._has_document_header(first[0]):
+            if not cls._has_td1_document_header(first[0]):
                 continue
             for second_index in range(first_index + 1, len(merged_lines)):
                 second = merged_lines[second_index]
-                nationality_index = second[0].find("AZE", 13, 20)
-                if (
-                    nationality_index not in {14, 15, 16}
-                    or not second[0][:6].isdigit()
-                ):
+                if not cls._looks_like_td1_second_line(second[0]):
                     continue
                 for third in merged_lines[second_index + 1 :]:
                     candidate = [first, second, third]
                     if cls._looks_like_td1(candidate):
-                        return candidate
-        return None
+                        candidates.append(
+                            MRZCandidate(
+                                "td1",
+                                tuple(candidate),
+                                cls._score_td1_candidate(candidate),
+                            )
+                        )
+        return candidates
+
+    @classmethod
+    def _score_td1_candidate(
+        cls,
+        lines: list[tuple[str, float]],
+    ) -> float:
+        (line1, confidence1), (line2, confidence2), (
+            line3,
+            confidence3,
+        ) = lines
+        normalized_line1 = cls._normalize_length(line1, 30)
+        checksum_valid = (
+            normalized_line1[14].isdigit()
+            and compute_mrz_check_digit(normalized_line1[5:14])
+            == int(normalized_line1[14])
+        )
+        nationality_index = line2.find("AZE", 12, 20)
+        serial_valid = cls._extract_new_card_serial_number(line1) is not None
+        return (
+            (30 if cls._has_document_header(line1) else 15)
+            + (10 if serial_valid else 0)
+            + sum(
+                max(0, 10 - abs(len(line) - 30))
+                for line in (line1, line2, line3)
+            )
+            + (15 if nationality_index in {14, 15, 16} else 5)
+            + (25 if checksum_valid else 0)
+            + (
+                (confidence1 + confidence2 + confidence3) / 3
+            )
+            * 20
+        )
 
     def _parse_td2(
         self,
         pair: tuple[tuple[str, float], tuple[str, float]],
         is_cropped: bool,
+    ) -> MRZResult:
+        attempt = "mrz_strip" if is_cropped else "full_image"
+        return self._parse_td2_lines(pair, attempt)
+
+    def _parse_td2_lines(
+        self,
+        pair: tuple[tuple[str, float], tuple[str, float]],
+        attempt: str,
     ) -> MRZResult:
         (raw_line1, line1_confidence), (
             raw_line2,
@@ -157,11 +349,7 @@ class MRZExtractor:
         line1 = self._normalize_length(raw_line1, 36)
         line2 = self._normalize_length(raw_line2, 36)
         fin_candidate = line2[28:35]
-        fin = (
-            fin_candidate
-            if re.fullmatch(r"[A-Z0-9]{7}", fin_candidate)
-            else None
-        )
+        fin = fin_candidate if is_valid_fin(fin_candidate) else None
         checksum_valid = (
             line2[9].isdigit()
             and compute_mrz_check_digit(line2[0:9]) == int(line2[9])
@@ -173,13 +361,7 @@ class MRZExtractor:
             line2=line2,
             line3="",
             checksum_valid=checksum_valid,
-            method=(
-                "td2_mrz_strip"
-                if fin and is_cropped
-                else "td2_full_image_fallback"
-                if fin
-                else "td2_not_found"
-            ),
+            method=f"td2_{attempt}" if fin else "not_found",
             card_type="older_card",
             card_serial_number=None,
         )
@@ -191,10 +373,15 @@ class MRZExtractor:
     ) -> MRZResult:
         selected_lines = self._find_td1_triplet(merged_lines)
         if selected_lines is None:
-            selected_lines = merged_lines[-3:]
-        while len(selected_lines) < 3:
-            selected_lines.append(("", 0.0))
+            return self._diagnostic_result(merged_lines)
+        attempt = "mrz_strip" if is_cropped else "full_image"
+        return self._parse_td1_lines(selected_lines, attempt)
 
+    def _parse_td1_lines(
+        self,
+        selected_lines: list[tuple[str, float]],
+        attempt: str,
+    ) -> MRZResult:
         raw_line1, line1_confidence = selected_lines[0]
         raw_line2, line2_confidence = selected_lines[1]
         raw_line3, line3_confidence = selected_lines[2]
@@ -218,11 +405,11 @@ class MRZExtractor:
                 value = optional_data[
                     len(issuing_state) : len(issuing_state) + 7
                 ]
-                if re.fullmatch(r"[A-Z0-9]{7}", value):
+                if is_valid_fin(value):
                     candidates.append(
                         (value, 10 + (2 if offset == 15 else 0), offset)
                     )
-            if re.fullmatch(r"[A-Z0-9]{7}", optional_data):
+            if is_valid_fin(optional_data):
                 candidates.append(
                     (optional_data, 8 + (2 if offset == 15 else 0), offset)
                 )
@@ -235,7 +422,7 @@ class MRZExtractor:
 
         candidates.sort(key=lambda item: item[0])
         candidates.sort(key=lambda item: item[1], reverse=True)
-        fin = candidates[0][0] if candidates else None
+        fin_candidate = candidates[0][0] if candidates else None
         checksum_valid = (
             len(line1) >= 15
             and line1[14].isdigit()
@@ -243,24 +430,26 @@ class MRZExtractor:
         )
         confidence = (
             (line1_confidence + line2_confidence + line3_confidence) / 3.0
-            if line1_confidence and line2_confidence and line3_confidence
+            if all(
+                value is not None
+                for value in (
+                    line1_confidence,
+                    line2_confidence,
+                    line3_confidence,
+                )
+            )
             else line1_confidence
         )
         is_new_card = self._looks_like_td1(selected_lines)
+        fin = fin_candidate if is_new_card else None
         return MRZResult(
             fin=fin,
             confidence=confidence,
             line1=line1,
             line2=line2,
             line3=line3,
-            checksum_valid=checksum_valid,
-            method=(
-                "mrz_strip"
-                if fin and is_cropped
-                else "full_image_fallback"
-                if fin
-                else "not_found"
-            ),
+            checksum_valid=checksum_valid and is_new_card,
+            method=f"td1_{attempt}" if fin else "not_found",
             card_type=(
                 "new_card"
                 if is_new_card
@@ -275,16 +464,12 @@ class MRZExtractor:
 
     @staticmethod
     def _extract_new_card_serial_number(line1: str) -> str | None:
-        serial_number = line1[5:14]
-        if re.fullmatch(r"A[AB]\d{7}", serial_number):
-            return serial_number
-        return None
+        match = re.search(r"A[AB]\d{7}", line1[:16])
+        return match.group(0) if match is not None else None
 
     @classmethod
     def is_structurally_valid(cls, result: MRZResult) -> bool:
-        if result.fin is None or not re.fullmatch(
-            r"[A-Z0-9]{7}", result.fin
-        ):
+        if result.fin is None or not is_valid_fin(result.fin):
             return False
         if result.card_type == "new_card":
             lines = [
@@ -306,6 +491,43 @@ class MRZExtractor:
         if len(value) < expected_length:
             return value + "<" * (expected_length - len(value))
         return value[:expected_length]
+
+    @classmethod
+    def _diagnostic_result(
+        cls,
+        merged_lines: list[tuple[str, float]],
+    ) -> MRZResult:
+        ranked = sorted(
+            enumerate(merged_lines),
+            key=lambda item: (
+                item[1][0].count("<"),
+                len(item[1][0]),
+            ),
+            reverse=True,
+        )[:3]
+        selected = [
+            line
+            for _, line in sorted(ranked, key=lambda item: item[0])
+        ]
+        while len(selected) < 3:
+            selected.append(("", 0.0))
+        confidence = (
+            sum(line_confidence for _, line_confidence in selected)
+            / len([text for text, _ in selected if text])
+            if any(text for text, _ in selected)
+            else 0.0
+        )
+        return MRZResult(
+            fin=None,
+            confidence=confidence,
+            line1=selected[0][0],
+            line2=selected[1][0],
+            line3=selected[2][0],
+            checksum_valid=False,
+            method="not_found",
+            card_type="unknown",
+            card_serial_number=None,
+        )
 
     @staticmethod
     def _not_found() -> MRZResult:
