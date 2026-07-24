@@ -50,7 +50,16 @@ class MRZExtractor:
         grouped_lines: list[list[dict]] = []
         current_line: list[dict] = []
         for block in blocks:
-            if current_line and abs(block["cy"] - current_line[-1]["cy"]) >= average_height * 0.7:
+            current_center = (
+                sum(item["cy"] for item in current_line) / len(current_line)
+                if current_line
+                else block["cy"]
+            )
+            if (
+                current_line
+                and abs(block["cy"] - current_center)
+                >= average_height * 0.7
+            ):
                 grouped_lines.append(current_line)
                 current_line = []
             current_line.append(block)
@@ -111,7 +120,30 @@ class MRZExtractor:
             and nationality_index in {14, 15, 16}
             and second[:6].isdigit()
             and bool(third.rstrip("<"))
+            and "<<" in third
         )
+
+    @classmethod
+    def _find_td1_triplet(
+        cls,
+        merged_lines: list[tuple[str, float]],
+    ) -> list[tuple[str, float]] | None:
+        for first_index, first in enumerate(merged_lines):
+            if not cls._has_document_header(first[0]):
+                continue
+            for second_index in range(first_index + 1, len(merged_lines)):
+                second = merged_lines[second_index]
+                nationality_index = second[0].find("AZE", 13, 20)
+                if (
+                    nationality_index not in {14, 15, 16}
+                    or not second[0][:6].isdigit()
+                ):
+                    continue
+                for third in merged_lines[second_index + 1 :]:
+                    candidate = [first, second, third]
+                    if cls._looks_like_td1(candidate):
+                        return candidate
+        return None
 
     def _parse_td2(
         self,
@@ -149,6 +181,7 @@ class MRZExtractor:
                 else "td2_not_found"
             ),
             card_type="older_card",
+            card_serial_number=None,
         )
 
     def _parse_td1(
@@ -156,7 +189,9 @@ class MRZExtractor:
         merged_lines: list[tuple[str, float]],
         is_cropped: bool,
     ) -> MRZResult:
-        selected_lines = merged_lines[-3:]
+        selected_lines = self._find_td1_triplet(merged_lines)
+        if selected_lines is None:
+            selected_lines = merged_lines[-3:]
         while len(selected_lines) < 3:
             selected_lines.append(("", 0.0))
 
@@ -211,6 +246,7 @@ class MRZExtractor:
             if line1_confidence and line2_confidence and line3_confidence
             else line1_confidence
         )
+        is_new_card = self._looks_like_td1(selected_lines)
         return MRZResult(
             fin=fin,
             confidence=confidence,
@@ -227,10 +263,22 @@ class MRZExtractor:
             ),
             card_type=(
                 "new_card"
-                if self._looks_like_td1(selected_lines)
+                if is_new_card
                 else "unknown"
             ),
+            card_serial_number=(
+                self._extract_new_card_serial_number(line1)
+                if is_new_card
+                else None
+            ),
         )
+
+    @staticmethod
+    def _extract_new_card_serial_number(line1: str) -> str | None:
+        serial_number = line1[5:14]
+        if re.fullmatch(r"A[AB]\d{7}", serial_number):
+            return serial_number
+        return None
 
     @classmethod
     def is_structurally_valid(cls, result: MRZResult) -> bool:
@@ -270,4 +318,5 @@ class MRZExtractor:
             checksum_valid=False,
             method="not_found",
             card_type="unknown",
+            card_serial_number=None,
         )

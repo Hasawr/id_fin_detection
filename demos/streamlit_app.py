@@ -20,6 +20,8 @@ st.caption(
     "Open **Integration Audit** in the sidebar to inspect third-party API traffic."
 )
 
+RESULT_SCHEMA_VERSION = 2
+
 
 @st.cache_resource
 def get_detector(use_gpu: bool) -> FINDetector:
@@ -29,6 +31,12 @@ def get_detector(use_gpu: bool) -> FINDetector:
 def clear_detection_results() -> None:
     st.session_state.pop("detected_results", None)
     st.session_state.pop("processing_seconds", None)
+
+
+if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
+    clear_detection_results()
+    get_detector.clear()
+    st.session_state["result_schema_version"] = RESULT_SCHEMA_VERSION
 
 
 use_gpu = st.sidebar.checkbox("Use GPU", value=True)
@@ -147,6 +155,17 @@ if detected_results:
                         st.info("Card type: Older card (2-line MRZ)")
                     else:
                         st.warning("Card type: Unknown")
+
+                    card_serial_number = getattr(
+                        mrz_result,
+                        "card_serial_number",
+                        None,
+                    )
+                    if card_serial_number:
+                        st.metric(
+                            "Card serial number",
+                            card_serial_number,
+                        )
 
                     st.write(f"**Detection method:** `{mrz_result.method}`")
                     if mrz_result.checksum_valid:

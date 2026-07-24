@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 
 from benchmarks.benchmark_id_fin import warm_latency_improvement
+from services.id_fin import FINDetectionOutput, MRZResult
 from services.id_fin.preprocessor import ImagePreprocessor
+from services.id_fin.service import IDFinService
 from services.id_fin.validator import (
     clean_mrz_line,
     compute_mrz_check_digit,
@@ -64,12 +66,14 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
 
     assert new_card.fin == "5H0H4NX"
     assert new_card.card_type == "new_card"
+    assert new_card.card_serial_number == "AA2039827"
     assert all(
         len(line) == 30
         for line in (new_card.line1, new_card.line2, new_card.line3)
     )
     assert old_card.fin == "2BDLLON"
     assert old_card.card_type == "older_card"
+    assert old_card.card_serial_number is None
     assert len(old_card.line1) == 36
     assert len(old_card.line2) == 36
     assert old_card.line3 == ""
@@ -146,6 +150,127 @@ def test_structural_validation_accepts_td1_and_td2() -> None:
 
     assert extractor.is_structurally_valid(td1)
     assert extractor.is_structurally_valid(td2)
+
+
+def test_new_card_serial_number_requires_aa_or_ab_and_seven_digits() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+
+    assert (
+        extractor._extract_new_card_serial_number(
+            "IAAZEAB1234567<<<<<<<<<<<<<<<<"
+        )
+        == "AB1234567"
+    )
+    assert (
+        extractor._extract_new_card_serial_number(
+            "IAAZEAC1234567<<<<<<<<<<<<<<<<"
+        )
+        is None
+    )
+    assert (
+        extractor._extract_new_card_serial_number(
+            "IAAZEAA123O567<<<<<<<<<<<<<<<<"
+        )
+        is None
+    )
+
+
+def test_td1_selection_ignores_interleaved_non_mrz_text() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    merged_lines = [
+        ("AZORBAYCAN", 0.99),
+        ("IAAZEAA12345670AZE1ABC234<<<<<", 0.93),
+        ("VSIQANIN<NOMRASI<CARD<NO", 0.74),
+        ("9001011M3001019AZE<<<<<<<<<<<0", 0.89),
+        ("AA1234567", 0.99),
+        ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.87),
+        ("ETIBARLILIQ<MUDDATI", 0.84),
+    ]
+
+    result = extractor._parse_td1(merged_lines, is_cropped=False)
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number == "AA1234567"
+
+
+def test_ocr_grouping_does_not_chain_adjacent_rows() -> None:
+    def make_block(
+        text: str,
+        center_y: int,
+        left: int,
+    ) -> list[object]:
+        return [
+            [
+                [left, center_y - 10],
+                [left + 200, center_y - 10],
+                [left + 200, center_y + 10],
+                [left, center_y + 10],
+            ],
+            (text, 0.95),
+        ]
+
+    class FakeOCR:
+        @staticmethod
+        def ocr(*_args, **_kwargs) -> list[list[list[object]]]:
+            return [
+                [
+                    make_block(
+                        "IAAZEAA12345670AZE1ABC234<<<<<",
+                        40,
+                        10,
+                    ),
+                    make_block("CARD NO", 48, 600),
+                    make_block(
+                        "9001011M3001019AZE<<<<<<<<<<<0",
+                        60,
+                        10,
+                    ),
+                    make_block("OTHER TEXT", 62, 800),
+                    make_block("AA1234567", 76, 600),
+                    make_block(
+                        "TEST<<PERSON<<<<<<<<<<<<<<<<<<",
+                        80,
+                        10,
+                    ),
+                ]
+            ]
+
+    extractor = MRZExtractor(FakeOCR())
+    result = extractor.extract(
+        np.zeros((100, 1000, 3), dtype=np.uint8),
+        is_cropped=False,
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number == "AA1234567"
+
+
+def test_service_serializes_card_serial_number() -> None:
+    mrz_result = MRZResult(
+        fin="1ABC234",
+        confidence=0.95,
+        line1="IAAZEAA12345670AZE1ABC234<<<<<",
+        line2="9001011M3001019AZE<<<<<<<<<<<0",
+        line3="TEST<<PERSON<<<<<<<<<<<<<<<<<<",
+        checksum_valid=True,
+        method="mrz_strip",
+        card_type="new_card",
+        card_serial_number="AA1234567",
+    )
+
+    serialized = IDFinService._serialize(
+        FINDetectionOutput(
+            fin="1ABC234",
+            confidence=0.95,
+            mrz_result=mrz_result,
+        )
+    )
+
+    mrz_details = serialized["mrz_details"]
+    assert isinstance(mrz_details, dict)
+    assert mrz_details["card_serial_number"] == "AA1234567"
 
 
 def test_warm_latency_gate_requires_20_percent_improvement() -> None:

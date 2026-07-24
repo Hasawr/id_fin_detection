@@ -11,6 +11,7 @@ class MRZResult:
     checksum_valid: bool
     method: str
     card_type: str
+    card_serial_number: str | None
 
 
 @dataclass

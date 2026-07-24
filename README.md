@@ -84,12 +84,19 @@ Successful responses use a stable service envelope:
   "data": {
     "fin": "7ABC123",
     "confidence": 0.96,
-    "mrz_details": {},
+    "mrz_details": {
+      "card_type": "new_card",
+      "card_serial_number": "AA1234567"
+    },
     "notes": []
   },
   "error": null
 }
 ```
+
+For new TD1 cards, `mrz_details.card_serial_number` contains the MRZ document
+number when it matches `AA` or `AB` followed by seven digits. It is `null` for
+older TD2 cards or when the value cannot be validated.
 
 For multiple cards, repeat the `mrz` multipart field:
 
