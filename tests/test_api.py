@@ -25,7 +25,12 @@ class FakeIDFinService:
         return {
             "fin": "7ABC123" if image_path else None,
             "confidence": 0.99 if image_path else 0.0,
-            "mrz_details": None,
+            "mrz_details": {
+                "card_type": "new_card",
+                "card_serial_number": "AA1234567",
+            }
+            if image_path
+            else None,
             "notes": [],
         }
 
@@ -117,8 +122,12 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
     events = store.recent_events(hours=None)
     assert len(events) == 1
     event = events[0]
-    assert event.result_summary == "FIN 7ABC123 (0.99)"
+    assert event.result_summary == "FIN 7ABC123 · Serial AA1234567 (0.99)"
     assert event.response_body["data"]["fin"] == "7ABC123"
+    assert (
+        event.response_body["data"]["mrz_details"]["card_serial_number"]
+        == "AA1234567"
+    )
     assert len(event.request_files) == 1
     assert event.request_files[0]["file_name"] == "id.png"
     saved = store.payload_dir.parent / event.request_files[0]["saved_path"]

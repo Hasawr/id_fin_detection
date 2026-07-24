@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from api.auth import require_api_key
-from api.schemas import ServiceResponse
+from api.schemas import IdFinBatchResponse, IdFinResponse
 from services.id_fin.service import IDFinService, get_id_fin_service
 from shared.config import Settings, get_settings
 from shared.image_io import save_upload
@@ -14,12 +14,27 @@ from shared.image_io import save_upload
 router = APIRouter(prefix="/v1", tags=["id-fin"])
 
 
-@router.post("/id-fin", response_model=ServiceResponse)
+@router.post(
+    "/id-fin",
+    response_model=IdFinResponse,
+    summary="Detect FIN and card serial from one MRZ image",
+    description=(
+        "Upload the MRZ side of an Azerbaijani ID card. "
+        "Returns the personal FIN when detected. For new TD1 cards, "
+        "`mrz_details.card_serial_number` is also returned when it matches "
+        "`AA` or `AB` followed by seven digits."
+    ),
+    responses={
+        401: {"description": "Missing or invalid API key"},
+        413: {"description": "Upload too large"},
+        422: {"description": "Invalid or unsupported image"},
+    },
+)
 async def detect_id_fin(
     api_key: Annotated[str, Depends(require_api_key)],
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
     mrz: Annotated[UploadFile, File(description="ID card MRZ-side image")],
-) -> ServiceResponse:
+) -> IdFinResponse:
     del api_key
 
     with TemporaryDirectory(prefix="ocr-id-fin-") as directory:
@@ -27,10 +42,25 @@ async def detect_id_fin(
         image_path = await save_upload(mrz, temporary_directory, "mrz")
         data = await service.process(image_path=image_path)
 
-    return ServiceResponse(service="id-fin", data=data)
+    return IdFinResponse(service="id-fin", data=data)
 
 
-@router.post("/id-fin/batch", response_model=ServiceResponse)
+@router.post(
+    "/id-fin/batch",
+    response_model=IdFinBatchResponse,
+    summary="Detect FIN and card serial from multiple MRZ images",
+    description=(
+        "Upload one or more MRZ-side images in a single request. "
+        "Each result includes `fin`, `confidence`, and `mrz_details` "
+        "(with `card_serial_number` for validated new-card serials). "
+        "Images are processed sequentially on the shared GPU."
+    ),
+    responses={
+        401: {"description": "Missing or invalid API key"},
+        413: {"description": "Too many files or upload too large"},
+        422: {"description": "Invalid or unsupported image"},
+    },
+)
 async def detect_id_fin_batch(
     api_key: Annotated[str, Depends(require_api_key)],
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
@@ -39,7 +69,7 @@ async def detect_id_fin_batch(
         list[UploadFile],
         File(description="One or more ID card MRZ-side images"),
     ],
-) -> ServiceResponse:
+) -> IdFinBatchResponse:
     del api_key
     if len(mrz) > settings.max_batch_files:
         for upload in mrz:
@@ -67,7 +97,7 @@ async def detect_id_fin_batch(
             zip(mrz, detected_results, strict=True)
         )
     ]
-    return ServiceResponse(
+    return IdFinBatchResponse(
         service="id-fin",
         data={"count": len(results), "results": results},
     )

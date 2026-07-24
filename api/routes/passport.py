@@ -15,6 +15,8 @@ router = APIRouter(prefix="/v1", tags=["passport"])
     "/passport",
     response_model=ServiceResponse,
     responses={501: {"model": ServiceResponse}},
+    summary="Passport OCR (not implemented)",
+    description="Placeholder endpoint. Returns HTTP 501 until passport OCR is available.",
 )
 async def detect_passport(
     api_key: Annotated[str, Depends(require_api_key)],

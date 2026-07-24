@@ -61,25 +61,59 @@ def summarize_response(payload: Any) -> str | None:
         return str(detail)[:160] if detail is not None else None
 
     if "fin" in data:
-        fin = data.get("fin")
-        confidence = data.get("confidence")
-        if fin:
-            if isinstance(confidence, (int, float)):
-                return f"FIN {fin} ({confidence:.2f})"
-            return f"FIN {fin}"
-        return "FIN not found"
+        return _summarize_id_fin_item(data)
 
     results = data.get("results")
     if isinstance(results, list):
-        fins = [item.get("fin") for item in results if isinstance(item, dict) and item.get("fin")]
         count = data.get("count", len(results))
-        if fins:
-            preview = ", ".join(str(fin) for fin in fins[:3])
-            extra = "" if len(fins) <= 3 else f" +{len(fins) - 3}"
-            return f"batch {count}: {preview}{extra}"
+        previews = [
+            _summarize_id_fin_item(item, include_confidence=False)
+            for item in results
+            if isinstance(item, dict)
+        ]
+        useful = [preview for preview in previews if preview and preview != "FIN not found"]
+        if useful:
+            shown = ", ".join(useful[:3])
+            extra = "" if len(useful) <= 3 else f" +{len(useful) - 3}"
+            return f"batch {count}: {shown}{extra}"
         return f"batch {count}: no FIN found"
 
     return None
+
+
+def _card_serial_from_item(item: dict[str, Any]) -> str | None:
+    details = item.get("mrz_details")
+    if not isinstance(details, dict):
+        return None
+    serial = details.get("card_serial_number")
+    return str(serial) if serial else None
+
+
+def _summarize_id_fin_item(
+    item: dict[str, Any],
+    *,
+    include_confidence: bool = True,
+) -> str:
+    fin = item.get("fin")
+    serial = _card_serial_from_item(item)
+    confidence = item.get("confidence")
+
+    parts: list[str] = []
+    if fin:
+        parts.append(f"FIN {fin}")
+    else:
+        parts.append("FIN not found")
+    if serial:
+        parts.append(f"Serial {serial}")
+
+    summary = " · ".join(parts)
+    if (
+        include_confidence
+        and fin
+        and isinstance(confidence, (int, float))
+    ):
+        summary = f"{summary} ({confidence:.2f})"
+    return summary
 
 
 @dataclass(frozen=True)
@@ -332,6 +366,7 @@ class AuditStore:
         hours: int | None = 24,
         service: str | None = None,
         success: bool | None = None,
+        fin_not_found: bool = False,
     ) -> list[AuditEvent]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -345,6 +380,13 @@ class AuditStore:
         if success is not None:
             clauses.append("success = ?")
             params.append(int(success))
+        if fin_not_found:
+            clauses.append(
+                "("
+                "LOWER(COALESCE(result_summary, '')) LIKE '%fin not found%' "
+                "OR LOWER(COALESCE(result_summary, '')) LIKE '%no fin found%'"
+                ")"
+            )
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)

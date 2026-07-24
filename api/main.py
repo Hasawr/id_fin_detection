@@ -22,9 +22,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Multi-service OCR API",
-    description="Versioned OCR endpoints for Azerbaijani identity documents.",
+    description=(
+        "Versioned OCR endpoints for Azerbaijani identity documents.\n\n"
+        "**Authentication:** send a configured key in the `X-API-Key` header.\n\n"
+        "**ID FIN service:** extracts the personal FIN from the MRZ side of an "
+        "ID card. For new TD1 cards, validated document serials "
+        "(`AA`/`AB` + 7 digits) are returned as `mrz_details.card_serial_number`."
+    ),
     version="1.0.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {
+            "name": "id-fin",
+            "description": "Azerbaijani ID card FIN and card-serial OCR.",
+        },
+        {
+            "name": "passport",
+            "description": "Passport OCR placeholder (not implemented yet).",
+        },
+        {
+            "name": "health",
+            "description": "Service health checks.",
+        },
+    ],
 )
 app.add_middleware(AuditMiddleware)
 app.include_router(health.router)
