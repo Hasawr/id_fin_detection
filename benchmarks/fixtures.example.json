@@ -1,0 +1,17 @@
+{
+  "cases": [
+    {
+      "id": "new-card-sample",
+      "path": "C:/private-fixtures/new-card.jpg",
+      "expected_card_type": "new_card",
+      "expected_fin_sha256": "replace-with-sha256-of-expected-fin"
+    },
+    {
+      "id": "older-card-sample",
+      "path": "C:/private-fixtures/older-card.jpg",
+      "expected_card_type": "older_card",
+      "expected_fin_sha256": "replace-with-sha256-of-expected-fin",
+      "crop": [0, 0, 1000, 700]
+    }
+  ]
+}

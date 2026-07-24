@@ -31,7 +31,13 @@ def configure_nvidia_dll_directories() -> None:
 
 
 class FINDetector:
-    def __init__(self, use_gpu: bool = True, debug: bool = False):
+    def __init__(
+        self,
+        use_gpu: bool = True,
+        debug: bool = False,
+        max_ocr_side: int = ImagePreprocessor.DEFAULT_MAX_OCR_SIDE,
+        det_limit_side_len: int = 960,
+    ):
         if use_gpu:
             configure_nvidia_dll_directories()
 
@@ -53,10 +59,13 @@ class FINDetector:
             show_log=False,
             use_gpu=use_gpu,
             max_text_length=40,
+            det_limit_side_len=det_limit_side_len,
+            det_limit_type="max",
         )
         self.preprocessor = ImagePreprocessor()
         self.mrz_extractor = MRZExtractor(ocr_engine)
         self.debug = debug
+        self.max_ocr_side = max_ocr_side
 
     def detect_from_mrz(self, image_path: str | Path) -> FINDetectionOutput:
         image_path = Path(image_path)
@@ -69,11 +78,18 @@ class FINDetector:
                 if rectified is image
                 else "Card ROI successfully detected and rectified."
             )
-            enhanced = self.preprocessor.enhance_for_mrz(rectified)
+            enhanced = self.preprocessor.bound_ocr_input(
+                self.preprocessor.enhance_for_mrz(rectified),
+                self.max_ocr_side,
+            )
             mrz_result = self.mrz_extractor.extract(enhanced, is_cropped=True)
-            if not mrz_result.fin or len(mrz_result.fin) != 7:
+            if not self.mrz_extractor.is_structurally_valid(mrz_result):
                 mrz_result = self.mrz_extractor.extract(
-                    rectified, is_cropped=False
+                    self.preprocessor.bound_ocr_input(
+                        rectified,
+                        self.max_ocr_side,
+                    ),
+                    is_cropped=False,
                 )
                 notes.append("FIN extraction fell back to full image scan.")
             else:

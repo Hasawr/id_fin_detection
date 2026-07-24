@@ -15,6 +15,9 @@ debug_output/
 documents/
 data/
 *.log
+benchmarks/fixtures.local.json
+benchmarks/results*.json
+benchmarks/baseline*.json
 
 .idea/
 .vscode/

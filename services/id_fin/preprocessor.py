@@ -5,6 +5,9 @@ import numpy as np
 
 
 class ImagePreprocessor:
+    MRZ_HEIGHT_RATIO = 0.35
+    DEFAULT_MAX_OCR_SIDE = 1600
+
     @staticmethod
     def load(image_path: str | Path) -> np.ndarray:
         image = cv2.imread(str(image_path))
@@ -35,15 +38,36 @@ class ImagePreprocessor:
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-    @staticmethod
-    def enhance_for_mrz(image: np.ndarray) -> np.ndarray:
+    @classmethod
+    def enhance_for_mrz(cls, image: np.ndarray) -> np.ndarray:
         height, width = image.shape[:2]
-        mrz_crop = image[int(height * 0.75) : height, 0:width]
+        mrz_crop = image[
+            int(height * (1.0 - cls.MRZ_HEIGHT_RATIO)) : height,
+            0:width,
+        ]
         gray = cv2.cvtColor(mrz_crop, cv2.COLOR_BGR2GRAY)
         enhanced = cv2.createCLAHE(
             clipLimit=3.0, tileGridSize=(8, 8)
         ).apply(gray)
         return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
+    def bound_ocr_input(
+        image: np.ndarray,
+        max_side: int = 1600,
+    ) -> np.ndarray:
+        if max_side <= 0:
+            raise ValueError("max_side must be positive.")
+        height, width = image.shape[:2]
+        longest_side = max(height, width)
+        if longest_side <= max_side:
+            return image
+        scale = max_side / longest_side
+        return cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
 
     @staticmethod
     def order_points(points: np.ndarray) -> np.ndarray:
@@ -60,8 +84,11 @@ class ImagePreprocessor:
     def detect_card_roi(cls, image: np.ndarray) -> np.ndarray:
         height, width = image.shape[:2]
         target_height = 600
-        scale = target_height / height
-        resized = cv2.resize(image, (int(width * scale), target_height))
+        scale = min(1.0, target_height / height)
+        resized = cv2.resize(
+            image,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+        )
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edged = cv2.Canny(blurred, 50, 150)
@@ -70,19 +97,38 @@ class ImagePreprocessor:
         )
         resized_area = resized.shape[0] * resized.shape[1]
         card_contour = None
+        rectangular_candidate = None
         for contour in sorted(contours, key=cv2.contourArea, reverse=True):
-            if cv2.contourArea(contour) < 0.15 * resized_area:
+            contour_area = cv2.contourArea(contour)
+            if contour_area < 0.15 * resized_area:
                 continue
             perimeter = cv2.arcLength(contour, True)
             approximate = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
             if len(approximate) == 4:
                 card_contour = approximate
                 break
+            rotated_rectangle = cv2.minAreaRect(contour)
+            rectangle_width, rectangle_height = rotated_rectangle[1]
+            if min(rectangle_width, rectangle_height) <= 0:
+                continue
+            aspect_ratio = max(rectangle_width, rectangle_height) / min(
+                rectangle_width, rectangle_height
+            )
+            rectangularity = contour_area / (
+                rectangle_width * rectangle_height
+            )
+            if 1.25 <= aspect_ratio <= 2.0 and rectangularity >= 0.65:
+                rectangular_candidate = cv2.boxPoints(rotated_rectangle)
+                break
 
         if card_contour is None:
-            return image
+            if rectangular_candidate is None:
+                return image
+            contour_points = rectangular_candidate
+        else:
+            contour_points = card_contour.reshape(4, 2)
 
-        rectangle = cls.order_points(card_contour.reshape(4, 2) / scale)
+        rectangle = cls.order_points(contour_points / scale)
         top_left, top_right, bottom_right, bottom_left = rectangle
         max_width = max(
             int(np.linalg.norm(bottom_right - bottom_left)),

@@ -232,6 +232,27 @@ class MRZExtractor:
             ),
         )
 
+    @classmethod
+    def is_structurally_valid(cls, result: MRZResult) -> bool:
+        if result.fin is None or not re.fullmatch(
+            r"[A-Z0-9]{7}", result.fin
+        ):
+            return False
+        if result.card_type == "new_card":
+            lines = [
+                (result.line1, result.confidence),
+                (result.line2, result.confidence),
+                (result.line3, result.confidence),
+            ]
+            return cls._looks_like_td1(lines)
+        if result.card_type == "older_card":
+            lines = [
+                (result.line1, result.confidence),
+                (result.line2, result.confidence),
+            ]
+            return cls._find_td2_pair(lines) is not None
+        return False
+
     @staticmethod
     def _normalize_length(value: str, expected_length: int) -> str:
         if len(value) < expected_length:

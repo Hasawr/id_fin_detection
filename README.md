@@ -125,6 +125,7 @@ demos/
   pages/                Streamlit pages (Integration Audit)
 shared/audit.py         SQLite audit store for third-party API calls
 tests/                  Logic and HTTP contract tests
+benchmarks/             PII-safe local accuracy and GPU performance harness
 ```
 
 The HTTP route handles transport and validation. Each package under
@@ -159,3 +160,33 @@ python -m pytest
 
 The API tests replace the OCR engine with a fake service, so they do not load
 PaddleOCR models or require real identity documents.
+
+## GPU benchmark
+
+This service remains a PaddleOCR GPU pipeline; it does not use ONNX Runtime.
+
+Create an ignored private fixture manifest from
+`benchmarks/fixtures.example.json`. Store only SHA-256 hashes of expected FIN
+values and never commit card images, local manifests, benchmark result files,
+or raw FIN values.
+
+```powershell
+python benchmarks\benchmark_id_fin.py `
+  --manifest benchmarks\fixtures.local.json `
+  --runs 7 `
+  --baseline benchmarks\baseline.local.json `
+  --min-improvement 0.20 `
+  --output benchmarks\results-final.local.json
+```
+
+On Windows 11, Python 3.12.10, PaddlePaddle GPU 2.6.2, CUDA 11.8, cuDNN 8.6,
+and an NVIDIA GeForce RTX 4060 Laptop GPU, the two-card TD1/TD2 fixture set
+improved from 170.9 ms to 57.6 ms warm median latency. Throughput increased
+from 5.89 to 17.32 images/s, full-image fallback fell from 50% to 0%, and all
+expected FIN/card-type results remained unchanged.
+
+The optimized pipeline localizes the card, OCRs its bottom 35% MRZ candidate,
+falls back to bounded full-card OCR only when the first result is not
+structurally valid, caps OCR inputs at 1600 pixels, and retains Paddle's
+measured 960-pixel detection-side limit. See `benchmarks/README.md` for the
+methodology and limitations.

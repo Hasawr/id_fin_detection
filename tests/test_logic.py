@@ -1,3 +1,8 @@
+import cv2
+import numpy as np
+
+from benchmarks.benchmark_id_fin import warm_latency_improvement
+from services.id_fin.preprocessor import ImagePreprocessor
 from services.id_fin.validator import (
     clean_mrz_line,
     compute_mrz_check_digit,
@@ -86,3 +91,63 @@ def test_truncated_old_card_is_not_classified_as_new() -> None:
     assert old_result.card_type == "older_card"
     assert old_result.fin is None
     assert fallback_result.card_type == "unknown"
+
+
+def test_localized_card_uses_bottom_35_percent_for_mrz() -> None:
+    card = np.zeros((200, 400, 3), dtype=np.uint8)
+    card[130:, :] = 255
+
+    mrz_candidate = ImagePreprocessor.enhance_for_mrz(card)
+
+    assert mrz_candidate.shape == (70, 400, 3)
+    assert mrz_candidate.mean() > 250
+
+
+def test_conservative_card_localization_and_input_cap() -> None:
+    photo = np.full((800, 1000, 3), 255, dtype=np.uint8)
+    cv2.rectangle(photo, (120, 180), (880, 660), (30, 30, 30), 8)
+
+    localized = ImagePreprocessor.detect_card_roi(photo)
+    bounded = ImagePreprocessor.bound_ocr_input(photo, max_side=500)
+
+    assert localized is not photo
+    assert 1.4 < localized.shape[1] / localized.shape[0] < 1.8
+    assert max(bounded.shape[:2]) == 500
+    assert bounded.shape[1] / bounded.shape[0] == photo.shape[1] / photo.shape[0]
+
+
+def test_structural_validation_rejects_truncated_td2() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    truncated_lines = [
+        ("I<AZERASHIDOVAINARA<<<<<<<<<<", 0.98),
+        ("14433235<1AZE8001195F3", 0.99),
+    ]
+
+    assert extractor._find_td2_pair(truncated_lines) is None
+
+
+def test_structural_validation_accepts_td1_and_td2() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    td1 = extractor._parse_td1(
+        [
+            ("IAAZEAA203982795H0H4NX<<<<<<<<", 0.99),
+            ("9601226M3006162AZE<<<<<<<<<<<5", 0.99),
+            ("VALIYEV<<OMAR<<<<<<<<<<<<<<<<<", 0.99),
+        ],
+        is_cropped=True,
+    )
+    td2 = extractor._parse_td2(
+        (
+            ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
+            ("19205792<7AZE8210276M32102712BDLLON5", 0.99),
+        ),
+        is_cropped=True,
+    )
+
+    assert extractor.is_structurally_valid(td1)
+    assert extractor.is_structurally_valid(td2)
+
+
+def test_warm_latency_gate_requires_20_percent_improvement() -> None:
+    assert warm_latency_improvement(0.08, 0.10) >= 0.2
+    assert warm_latency_improvement(0.081, 0.10) < 0.2
