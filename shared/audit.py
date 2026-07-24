@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
+import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -79,6 +80,31 @@ def summarize_response(payload: Any) -> str | None:
         return f"batch {count}: no FIN found"
 
     return None
+
+
+def ocr_outcome_counts(payload: Any) -> tuple[int, int]:
+    if not isinstance(payload, dict):
+        return 0, 0
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return 0, 0
+
+    if "fin" in data:
+        return (1, 0) if data.get("fin") else (0, 1)
+
+    results = data.get("results")
+    if not isinstance(results, list):
+        return 0, 0
+    detected = 0
+    not_found = 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        if item.get("fin"):
+            detected += 1
+        else:
+            not_found += 1
+    return detected, not_found
 
 
 def _card_serial_from_item(item: dict[str, Any]) -> str | None:
@@ -174,6 +200,8 @@ class AuditStore:
                     request_files_json TEXT,
                     response_body_json TEXT,
                     result_summary TEXT,
+                    ocr_detected INTEGER NOT NULL DEFAULT 0,
+                    ocr_not_found INTEGER NOT NULL DEFAULT 0,
                     payload_dir TEXT
                 )
                 """
@@ -205,13 +233,46 @@ class AuditStore:
             "request_files_json": "TEXT",
             "response_body_json": "TEXT",
             "result_summary": "TEXT",
+            "ocr_detected": "INTEGER NOT NULL DEFAULT 0",
+            "ocr_not_found": "INTEGER NOT NULL DEFAULT 0",
             "payload_dir": "TEXT",
         }
+        added_outcome_columns = False
         for column, column_type in additions.items():
             if column not in existing:
                 connection.execute(
                     f"ALTER TABLE api_audit_events ADD COLUMN {column} {column_type}"
                 )
+                if column in {"ocr_detected", "ocr_not_found"}:
+                    added_outcome_columns = True
+        if added_outcome_columns:
+            self._backfill_ocr_outcomes(connection)
+
+    @staticmethod
+    def _backfill_ocr_outcomes(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            """
+            SELECT id, response_body_json
+            FROM api_audit_events
+            WHERE response_body_json IS NOT NULL
+            """
+        ).fetchall()
+        updates = []
+        for row in rows:
+            try:
+                payload = json.loads(row["response_body_json"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            detected, not_found = ocr_outcome_counts(payload)
+            updates.append((detected, not_found, row["id"]))
+        connection.executemany(
+            """
+            UPDATE api_audit_events
+            SET ocr_detected = ?, ocr_not_found = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
 
     def record(
         self,
@@ -235,6 +296,7 @@ class AuditStore:
         success = 200 <= status_code < 400
         fingerprint = fingerprint_api_key(api_key)
         result_summary = summarize_response(response_body)
+        ocr_detected, ocr_not_found = ocr_outcome_counts(response_body)
         files_json = json.dumps(request_files or [], ensure_ascii=False)
         response_json = (
             json.dumps(response_body, ensure_ascii=False, default=str)
@@ -262,8 +324,10 @@ class AuditStore:
                     request_files_json,
                     response_body_json,
                     result_summary,
+                    ocr_detected,
+                    ocr_not_found,
                     payload_dir
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     created_at,
@@ -282,6 +346,8 @@ class AuditStore:
                     files_json,
                     response_json,
                     result_summary,
+                    ocr_detected,
+                    ocr_not_found,
                     payload_dir,
                 ),
             )
@@ -300,6 +366,51 @@ class AuditStore:
         directory.mkdir(parents=True, exist_ok=True)
         return directory
 
+    def clear_all(self) -> dict[str, int]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT payload_dir
+                FROM api_audit_events
+                WHERE payload_dir IS NOT NULL AND payload_dir != ''
+                """
+            ).fetchall()
+            deleted_events = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM api_audit_events"
+                ).fetchone()[0]
+            )
+            connection.execute("DELETE FROM api_audit_events")
+            connection.execute(
+                "DELETE FROM sqlite_sequence WHERE name = 'api_audit_events'"
+            )
+            connection.commit()
+
+        payload_root = self.payload_dir.resolve()
+        data_root = payload_root.parent
+        deleted_payload_directories = 0
+        for row in rows:
+            raw_path = Path(row["payload_dir"])
+            candidate = (
+                raw_path
+                if raw_path.is_absolute()
+                else data_root / raw_path
+            ).resolve()
+            if (
+                candidate == payload_root
+                or payload_root not in candidate.parents
+            ):
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+                deleted_payload_directories += 1
+
+        self.payload_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "events": deleted_events,
+            "payload_directories": deleted_payload_directories,
+        }
+
     def summary(self, *, hours: int | None = 24) -> dict[str, Any]:
         where, params = self._time_filter(hours)
         with self._lock, self._connect() as connection:
@@ -309,6 +420,8 @@ class AuditStore:
                     COUNT(*) AS total,
                     COALESCE(SUM(success), 0) AS succeeded,
                     COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed,
+                    COALESCE(SUM(ocr_detected), 0) AS ocr_detected,
+                    COALESCE(SUM(ocr_not_found), 0) AS ocr_not_found,
                     COALESCE(AVG(latency_ms), 0) AS avg_latency_ms
                 FROM api_audit_events
                 {where}
@@ -322,7 +435,9 @@ class AuditStore:
                     COALESCE(service, path) AS name,
                     COUNT(*) AS total,
                     COALESCE(SUM(success), 0) AS succeeded,
-                    COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed
+                    COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed,
+                    COALESCE(SUM(ocr_detected), 0) AS ocr_detected,
+                    COALESCE(SUM(ocr_not_found), 0) AS ocr_not_found
                 FROM api_audit_events
                 {where}
                 GROUP BY COALESCE(service, path)
@@ -337,7 +452,9 @@ class AuditStore:
                     COALESCE(api_key_fingerprint, 'none') AS fingerprint,
                     COUNT(*) AS total,
                     COALESCE(SUM(success), 0) AS succeeded,
-                    COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed
+                    COALESCE(SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END), 0) AS failed,
+                    COALESCE(SUM(ocr_detected), 0) AS ocr_detected,
+                    COALESCE(SUM(ocr_not_found), 0) AS ocr_not_found
                 FROM api_audit_events
                 {where}
                 GROUP BY COALESCE(api_key_fingerprint, 'none')
@@ -349,11 +466,21 @@ class AuditStore:
         total = int(totals["total"])
         succeeded = int(totals["succeeded"])
         failed = int(totals["failed"])
+        ocr_detected = int(totals["ocr_detected"])
+        ocr_not_found = int(totals["ocr_not_found"])
+        ocr_total = ocr_detected + ocr_not_found
         return {
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
             "success_rate": (succeeded / total * 100.0) if total else 0.0,
+            "ocr_detected": ocr_detected,
+            "ocr_not_found": ocr_not_found,
+            "detection_rate": (
+                ocr_detected / ocr_total * 100.0
+                if ocr_total
+                else 0.0
+            ),
             "avg_latency_ms": float(totals["avg_latency_ms"]),
             "by_service": [dict(row) for row in by_service],
             "by_key": [dict(row) for row in by_key],

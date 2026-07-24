@@ -117,6 +117,9 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
     summary = store.summary(hours=None)
     assert summary["total"] == 1
     assert summary["succeeded"] == 1
+    assert summary["ocr_detected"] == 1
+    assert summary["ocr_not_found"] == 0
+    assert summary["detection_rate"] == 100.0
     assert summary["by_service"][0]["name"] == "id-fin"
 
     events = store.recent_events(hours=None)
@@ -155,6 +158,92 @@ def test_id_fin_batch_accepts_multiple_uploads(client) -> None:
         for result in response.json()["data"]["results"]
     )
     assert store.summary(hours=None)["total"] == 1
+    assert store.summary(hours=None)["ocr_detected"] == 2
+
+
+def test_audit_counts_http_ok_without_fin_as_not_found(client) -> None:
+    _, store = client
+    store.record(
+        method="POST",
+        path="/v1/id-fin",
+        service="id-fin",
+        status_code=200,
+        latency_ms=10,
+        response_body={
+            "service": "id-fin",
+            "data": {
+                "fin": None,
+                "confidence": 0.0,
+                "mrz_details": None,
+                "notes": ["MRZ not found"],
+            },
+            "error": None,
+        },
+    )
+
+    summary = store.summary(hours=None)
+    assert summary["succeeded"] == 1
+    assert summary["failed"] == 0
+    assert summary["ocr_detected"] == 0
+    assert summary["ocr_not_found"] == 1
+    assert summary["detection_rate"] == 0.0
+
+
+def test_audit_counts_each_result_in_mixed_batch(client) -> None:
+    _, store = client
+    store.record(
+        method="POST",
+        path="/v1/id-fin/batch",
+        service="id-fin",
+        status_code=200,
+        latency_ms=20,
+        response_body={
+            "service": "id-fin",
+            "data": {
+                "count": 2,
+                "results": [
+                    {"fin": "7ABC123"},
+                    {"fin": None},
+                ],
+            },
+            "error": None,
+        },
+    )
+
+    summary = store.summary(hours=None)
+    assert summary["ocr_detected"] == 1
+    assert summary["ocr_not_found"] == 1
+    assert summary["detection_rate"] == 50.0
+
+
+def test_audit_clear_all_removes_events_and_saved_payloads(client) -> None:
+    _, store = client
+    payload_directory = store.payload_dir / "2026" / "07" / "request"
+    payload_directory.mkdir(parents=True)
+    (payload_directory / "id.png").write_bytes(VALID_PNG)
+    relative_payload_directory = payload_directory.relative_to(
+        store.payload_dir.parent
+    )
+    store.record(
+        method="POST",
+        path="/v1/id-fin",
+        service="id-fin",
+        status_code=200,
+        latency_ms=10,
+        response_body={
+            "service": "id-fin",
+            "data": {"fin": "7ABC123"},
+            "error": None,
+        },
+        payload_dir=str(relative_payload_directory),
+    )
+
+    deleted = store.clear_all()
+
+    assert deleted == {"events": 1, "payload_directories": 1}
+    assert store.summary(hours=None)["total"] == 0
+    assert not payload_directory.exists()
+    assert store.payload_dir.is_dir()
 
 
 def test_id_fin_batch_enforces_file_limit(client) -> None:
