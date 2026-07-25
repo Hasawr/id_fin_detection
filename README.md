@@ -44,7 +44,8 @@ GPU acceleration is enabled by default with `USE_GPU=true`, and the project
 installs `paddlepaddle-gpu`. A compatible NVIDIA driver is required. The CLI
 also uses GPU by default; pass `--cpu` only for an explicit CPU run.
 
-Start the API from the repository root:
+Start the API from the repository root (one process — the in-app GPU pool
+handles parallelism; do not raise uvicorn `--workers` above 1 on the OCR host):
 
 ```powershell
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
@@ -112,14 +113,29 @@ curl.exe -X POST "http://localhost:8000/v1/id-fin/batch" `
 
 Batch responses contain `data.count` and an ordered `data.results` list. Each
 result includes `index`, `file_name`, `fin`, `confidence`, `mrz_details`, and
-`notes`. OCR runs sequentially on the shared GPU to avoid concurrent model
-access and GPU-memory spikes.
+`notes`. Batch items and concurrent HTTP requests share a bounded GPU worker
+pool (`OCR_MAX_CONCURRENCY`). Extra requests wait for a free worker instead of
+overloading VRAM.
+
+| Host | Suggested `OCR_MAX_CONCURRENCY` |
+| --- | --- |
+| Dev laptop (6–8 GB VRAM) | `1`–`2` |
+| Mid GPU (12–16 GB) | `3`–`4` |
+| Core PC (RTX 5090 32 GB + 14700K / 64 GB RAM) | `8` (start), `10`–`12` if VRAM headroom remains |
+
+On the core server, set in `.env`:
+
+```dotenv
+USE_GPU=true
+OCR_MAX_CONCURRENCY=8
+MAX_BATCH_FILES=20
+```
 
 Each image is limited by `MAX_UPLOAD_BYTES` (10 MiB by default) and
 `MAX_IMAGE_PIXELS` (25 megapixels by default). File signatures are verified
-before OCR. A batch accepts at most `MAX_BATCH_FILES` images (10 by default).
-Uploaded files are stored in a request-specific temporary directory and
-removed after processing.
+before OCR. A batch accepts at most `MAX_BATCH_FILES` images (20 on the core
+PC example above). Uploaded files are stored in a request-specific temporary
+directory and removed after processing.
 
 ## Project structure
 
@@ -139,9 +155,9 @@ benchmarks/             PII-safe local accuracy and GPU performance harness
 ```
 
 The HTTP route handles transport and validation. Each package under
-`services/` owns its OCR implementation. `IDFinService` serializes the OCR
-result and runs the blocking detector in a worker thread with a lock around
-the shared PaddleOCR instance.
+`services/` owns its OCR implementation. `IDFinService` keeps a pool of
+PaddleOCR workers and runs inference on a thread-pool executor so many
+requests can progress at once up to `OCR_MAX_CONCURRENCY`.
 
 ## Add another OCR service
 

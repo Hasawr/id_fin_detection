@@ -55,7 +55,8 @@ async def detect_id_fin(
         "Each result includes `fin`, `confidence`, and `mrz_details` "
         "(with `card_serial_number` for validated new-card and older-card "
         "serials). "
-        "Images are processed sequentially on the shared GPU."
+        "Images in a batch are processed in parallel up to "
+        "`OCR_MAX_CONCURRENCY` GPU workers."
     ),
     responses={
         401: {"description": "Missing or invalid API key"},

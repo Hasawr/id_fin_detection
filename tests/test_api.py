@@ -44,6 +44,13 @@ class FakeIDFinService:
             for image_path in image_paths
         ]
 
+    def concurrency_info(self) -> dict[str, object]:
+        return {
+            "max_concurrency": 2,
+            "workers": 2,
+            "available_workers": 2,
+        }
+
 
 @pytest.fixture()
 def client(tmp_path: Path):
@@ -60,6 +67,7 @@ def client(tmp_path: Path):
             max_upload_bytes=1024 * 1024,
             max_image_pixels=1_000_000,
             max_batch_files=2,
+            ocr_max_concurrency=2,
             audit_db_path=audit_db,
             audit_payload_dir=payload_dir,
         )
@@ -82,6 +90,8 @@ def test_health_does_not_require_authentication(client) -> None:
     assert response.json() == {
         "status": "ok",
         "services": ["id-fin", "passport"],
+        "ocr_max_concurrency": 2,
+        "ocr_available_workers": 2,
     }
 
 

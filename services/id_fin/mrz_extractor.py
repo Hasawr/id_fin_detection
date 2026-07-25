@@ -81,10 +81,69 @@ class MRZExtractor:
             return self._not_found()
 
         merged_lines = self._merge_blocks(blocks)
+        merged_lines = self._prefer_mrz_like_lines(merged_lines)
         attempt_name = attempt or (
             "mrz_strip" if is_cropped else "full_image"
         )
         return self._select_best_result(merged_lines, attempt_name)
+
+    @staticmethod
+    def _mrz_line_score(text: str) -> float:
+        """Score how MRZ-like a cleaned OCR line is vs normal card prose."""
+        if not text:
+            return -10.0
+        filler_ratio = text.count("<") / max(len(text), 1)
+        has_header = bool(re.match(r"^I(?:<|A)?AZE", text)) or text.startswith(
+            "IAA"
+        )
+        has_aze = "AZE" in text
+        has_name_sep = "<<" in text
+        digit_ratio = sum(char.isdigit() for char in text) / max(len(text), 1)
+        # Long prose with almost no fillers is usually top-of-card instructions.
+        prose_penalty = (
+            -8.0
+            if len(text) > 40 and filler_ratio < 0.08 and not has_aze
+            else 0.0
+        )
+        return (
+            filler_ratio * 12
+            + (8 if has_header else 0)
+            + (4 if has_aze else 0)
+            + (3 if has_name_sep else 0)
+            + digit_ratio * 4
+            + min(len(text), 40) / 8
+            + prose_penalty
+        )
+
+    @classmethod
+    def _prefer_mrz_like_lines(
+        cls,
+        merged_lines: list[tuple[str, float]],
+    ) -> list[tuple[str, float]]:
+        if len(merged_lines) <= 3:
+            return merged_lines
+        scored = [
+            (index, line, cls._mrz_line_score(line[0]))
+            for index, line in enumerate(merged_lines)
+        ]
+        best_score = max(score for _, _, score in scored)
+        threshold = max(best_score * 0.45, 8.0)
+        selected = [
+            (index, line)
+            for index, line, score in scored
+            if score >= threshold
+        ]
+        if len(selected) < 2:
+            selected = [
+                (index, line)
+                for index, line, _ in sorted(
+                    scored,
+                    key=lambda item: item[2],
+                    reverse=True,
+                )[:3]
+            ]
+        selected.sort(key=lambda item: item[0])
+        return [line for _, line in selected]
 
     @staticmethod
     def _merge_blocks(blocks: list[dict]) -> list[tuple[str, float]]:
@@ -105,7 +164,7 @@ class MRZExtractor:
             if (
                 current_line
                 and abs(block["cy"] - current_center)
-                >= average_height * 0.7
+                >= average_height * 0.55
             ):
                 grouped_lines.append(current_line)
                 current_line = []

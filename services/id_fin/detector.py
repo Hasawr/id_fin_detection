@@ -149,14 +149,20 @@ class FINDetector:
     def _build_attempts(self, rectified) -> list[OCRAttempt]:
         deskewed_cache: dict[str, object] = {}
 
-        def get_mrz_roi(source):
+        def prepare_crop(image, *, binarize: bool = False):
+            return self.preprocessor.bound_ocr_input(
+                self.preprocessor.prepare_mrz_for_ocr(
+                    image,
+                    binarize=binarize,
+                ),
+                self.max_ocr_side,
+            )
+
+        def get_mrz_roi(source, *, binarize: bool = False):
             mrz_roi = self.preprocessor.detect_mrz_roi(source)
             if mrz_roi is None:
                 return None
-            return self.preprocessor.bound_ocr_input(
-                self.preprocessor.enhance_mrz_image(mrz_roi),
-                self.max_ocr_side,
-            )
+            return prepare_crop(mrz_roi, binarize=binarize)
 
         def get_deskewed():
             if "image" not in deskewed_cache:
@@ -164,18 +170,20 @@ class FINDetector:
             deskewed = deskewed_cache["image"]
             return None if deskewed is rectified else deskewed
 
-        def get_deskewed_strip():
+        def get_strip(ratio: float, *, binarize: bool = False, source=None):
+            base = rectified if source is None else source
+            strip = self.preprocessor.crop_mrz_strip(base, height_ratio=ratio)
+            return prepare_crop(strip, binarize=binarize)
+
+        def get_deskewed_strip(ratio: float, *, binarize: bool = False):
             deskewed = get_deskewed()
             if deskewed is None:
                 return None
-            return self.preprocessor.bound_ocr_input(
-                self.preprocessor.enhance_for_mrz(deskewed),
-                self.max_ocr_side,
-            )
+            return get_strip(ratio, binarize=binarize, source=deskewed)
 
-        def get_deskewed_mrz_roi():
+        def get_deskewed_mrz_roi(*, binarize: bool = False):
             deskewed = get_deskewed()
-            return None if deskewed is None else get_mrz_roi(deskewed)
+            return None if deskewed is None else get_mrz_roi(deskewed, binarize=binarize)
 
         def get_deskewed_full():
             deskewed = get_deskewed()
@@ -189,9 +197,16 @@ class FINDetector:
         return [
             OCRAttempt(
                 name="mrz_strip",
-                image_factory=lambda: self.preprocessor.bound_ocr_input(
-                    self.preprocessor.enhance_for_mrz(rectified),
-                    self.max_ocr_side,
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO
+                ),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="mrz_strip_binarized",
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO,
+                    binarize=True,
                 ),
                 is_cropped=True,
             ),
@@ -201,13 +216,42 @@ class FINDetector:
                 is_cropped=True,
             ),
             OCRAttempt(
+                name="mrz_roi_binarized",
+                image_factory=lambda: get_mrz_roi(rectified, binarize=True),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="mrz_strip_wide",
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO_WIDE
+                ),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="mrz_strip_tight",
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO_TIGHT
+                ),
+                is_cropped=True,
+            ),
+            OCRAttempt(
                 name="deskewed_mrz_roi",
-                image_factory=get_deskewed_mrz_roi,
+                image_factory=lambda: get_deskewed_mrz_roi(),
                 is_cropped=True,
             ),
             OCRAttempt(
                 name="deskewed_mrz_strip",
-                image_factory=get_deskewed_strip,
+                image_factory=lambda: get_deskewed_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO
+                ),
+                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="deskewed_mrz_strip_binarized",
+                image_factory=lambda: get_deskewed_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO,
+                    binarize=True,
+                ),
                 is_cropped=True,
             ),
             OCRAttempt(

@@ -133,8 +133,10 @@ def test_localized_card_uses_bottom_35_percent_for_mrz() -> None:
 
     mrz_candidate = ImagePreprocessor.enhance_for_mrz(card)
 
-    assert mrz_candidate.shape == (70, 400, 3)
-    assert mrz_candidate.mean() > 250
+    # Bottom 35% is upscaled for OCR readability of thin MRZ fillers.
+    assert mrz_candidate.shape[1] >= ImagePreprocessor.MIN_MRZ_OCR_WIDTH
+    assert abs(mrz_candidate.shape[0] / mrz_candidate.shape[1] - 70 / 400) < 0.02
+    assert mrz_candidate.mean() > 200
 
 
 def test_conservative_card_localization_and_input_cap() -> None:
@@ -536,6 +538,10 @@ def test_detector_uses_deskew_only_after_regular_fallback_fails() -> None:
     attempted_names: list[str | None] = []
 
     class FakePreprocessor:
+        MRZ_HEIGHT_RATIO = 0.35
+        MRZ_HEIGHT_RATIO_TIGHT = 0.28
+        MRZ_HEIGHT_RATIO_WIDE = 0.45
+
         @staticmethod
         def load(_path) -> np.ndarray:
             return original
@@ -545,16 +551,25 @@ def test_detector_uses_deskew_only_after_regular_fallback_fails() -> None:
             return image
 
         @staticmethod
-        def enhance_for_mrz(image: np.ndarray) -> np.ndarray:
+        def crop_mrz_strip(
+            image: np.ndarray,
+            height_ratio: float | None = None,
+        ) -> np.ndarray:
+            del height_ratio
             return image[:35]
+
+        @staticmethod
+        def prepare_mrz_for_ocr(
+            image: np.ndarray,
+            *,
+            binarize: bool = False,
+        ) -> np.ndarray:
+            del binarize
+            return image
 
         @staticmethod
         def detect_mrz_roi(_image: np.ndarray) -> None:
             return None
-
-        @staticmethod
-        def enhance_mrz_image(image: np.ndarray) -> np.ndarray:
-            return image
 
         @staticmethod
         def bound_ocr_input(
@@ -607,14 +622,153 @@ def test_detector_uses_deskew_only_after_regular_fallback_fails() -> None:
         "FIN extracted using deskewed_full_image."
         in result.notes
     )
-    assert attempted_names == [
-        "mrz_strip",
-        "deskewed_mrz_strip",
-        "full_image",
-        "deskewed_full_image",
+    assert attempted_names[0] == "mrz_strip"
+    assert "mrz_strip_binarized" in attempted_names
+    assert attempted_names[-1] == "deskewed_full_image"
+
+
+def test_mrz_upscale_and_binarize_helpers() -> None:
+    small = np.full((40, 200, 3), 180, dtype=np.uint8)
+    cv2.putText(
+        small,
+        "IAAZEAA1234567",
+        (5, 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (20, 20, 20),
+        1,
+        cv2.LINE_AA,
+    )
+
+    upscaled = ImagePreprocessor.upscale_mrz_if_needed(small, min_width=400)
+    binarized = ImagePreprocessor.enhance_mrz_image(small, binarize=True)
+
+    assert upscaled.shape[1] >= 400
+    assert binarized.shape[:2] == small.shape[:2]
+    assert set(np.unique(binarized).tolist()).issubset({0, 255})
+
+
+def test_prefer_mrz_like_lines_filters_top_prose() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    merged_lines = [
+        ("SAXSIYYAT<VASIGASININ<ETIBARLILIG<MUDDATI<BITDIKDA", 0.9),
+        ("V<YA<SAXSIYYET<VESIQASI<<0<CUMLADAN", 0.9),
+        ("DAYISDIRILMASI<UCUN<VASIGANI<VERAN", 0.9),
+        ("IAAZEAA374226192VW8N8P<<<<<<<<", 0.95),
+        ("8807179F3112157AZE<<<<<<<<<<<5", 0.94),
+        ("BAHMANI<<ZIBA<<<<<<<<<<<<<<<<", 0.93),
+        ("QAN<QRUPU<BLOOD<GROUP", 0.8),
     ]
+
+    preferred = extractor._prefer_mrz_like_lines(merged_lines)
+
+    texts = [text for text, _ in preferred]
+    assert "IAAZEAA374226192VW8N8P<<<<<<<<" in texts
+    assert "8807179F3112157AZE<<<<<<<<<<<5" in texts
+    assert "BAHMANI<<ZIBA<<<<<<<<<<<<<<<<" in texts
+    assert all(
+        "ETIBARLILIG" not in text and "DAYISDIRILMASI" not in text
+        for text in texts
+    )
 
 
 def test_warm_latency_gate_requires_20_percent_improvement() -> None:
     assert warm_latency_improvement(0.08, 0.10) >= 0.2
     assert warm_latency_improvement(0.081, 0.10) < 0.2
+
+
+def test_detector_pool_allows_parallel_workers() -> None:
+    import threading
+    import time
+
+    from services.id_fin.service import DetectorPool, serialize_fin_detection
+
+    created: list[object] = []
+    active = 0
+    peak_active = 0
+    lock = threading.Lock()
+
+    class FakeDetector:
+        def detect_from_mrz(self, _path: str) -> FINDetectionOutput:
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return FINDetectionOutput(
+                fin="1ABC234",
+                confidence=0.9,
+                mrz_result=None,
+                notes=[],
+            )
+
+    def factory() -> FakeDetector:
+        detector = FakeDetector()
+        created.append(detector)
+        return detector
+
+    pool = DetectorPool(2, factory)
+    assert len(created) == 2
+
+    def run_one() -> None:
+        with pool.acquire() as detector:
+            serialize_fin_detection(detector.detect_from_mrz("x.png"))
+
+    threads = [threading.Thread(target=run_one) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert peak_active == 2
+    assert pool.stats()["available"] == 2
+
+
+def test_id_fin_service_processes_batch_in_parallel(monkeypatch) -> None:
+    import asyncio
+    import time
+    from pathlib import Path
+
+    from services.id_fin import service as service_module
+
+    class FakeSettings:
+        use_gpu = False
+        debug = False
+        ocr_max_concurrency = 2
+
+    monkeypatch.setattr(service_module, "get_settings", lambda: FakeSettings())
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            time.sleep(0.08)
+            return FINDetectionOutput(
+                fin=f"FIN-{Path(image_path).name}",
+                confidence=0.91,
+                mrz_result=None,
+                notes=[],
+            )
+
+    monkeypatch.setattr(service_module, "FINDetector", FakeDetector)
+    service = service_module.IDFinService()
+    began = time.perf_counter()
+    results = asyncio.run(
+        service.process_many(
+            image_paths=[Path("a.png"), Path("b.png"), Path("c.png")]
+        )
+    )
+    elapsed = time.perf_counter() - began
+
+    assert [item["fin"] for item in results] == [
+        "FIN-a.png",
+        "FIN-b.png",
+        "FIN-c.png",
+    ]
+    # 3 jobs with 2 workers and ~0.08s each should finish well under serial 0.24s.
+    assert elapsed < 0.22
+    assert service.concurrency_info()["max_concurrency"] == 2
+

@@ -6,7 +6,11 @@ import numpy as np
 
 class ImagePreprocessor:
     MRZ_HEIGHT_RATIO = 0.35
+    MRZ_HEIGHT_RATIO_TIGHT = 0.28
+    MRZ_HEIGHT_RATIO_WIDE = 0.45
     DEFAULT_MAX_OCR_SIDE = 1600
+    MIN_MRZ_OCR_WIDTH = 1200
+    CARD_MIN_AREA_RATIO = 0.04
 
     @staticmethod
     def load(image_path: str | Path) -> np.ndarray:
@@ -39,21 +43,81 @@ class ImagePreprocessor:
         )
 
     @classmethod
-    def enhance_for_mrz(cls, image: np.ndarray) -> np.ndarray:
+    def crop_mrz_strip(
+        cls,
+        image: np.ndarray,
+        height_ratio: float | None = None,
+    ) -> np.ndarray:
+        ratio = cls.MRZ_HEIGHT_RATIO if height_ratio is None else height_ratio
         height, width = image.shape[:2]
-        mrz_crop = image[
-            int(height * (1.0 - cls.MRZ_HEIGHT_RATIO)) : height,
-            0:width,
-        ]
-        return cls.enhance_mrz_image(mrz_crop)
+        top = int(height * (1.0 - ratio))
+        return image[top:height, 0:width]
+
+    @classmethod
+    def enhance_for_mrz(
+        cls,
+        image: np.ndarray,
+        height_ratio: float | None = None,
+    ) -> np.ndarray:
+        mrz_crop = cls.crop_mrz_strip(image, height_ratio=height_ratio)
+        return cls.prepare_mrz_for_ocr(mrz_crop)
+
+    @classmethod
+    def prepare_mrz_for_ocr(
+        cls,
+        image: np.ndarray,
+        *,
+        binarize: bool = False,
+    ) -> np.ndarray:
+        """Contrast + mild sharpen + optional binarize, then upscale thin MRZ crops."""
+        enhanced = cls.enhance_mrz_image(image, binarize=binarize)
+        return cls.upscale_mrz_if_needed(enhanced)
 
     @staticmethod
-    def enhance_mrz_image(image: np.ndarray) -> np.ndarray:
+    def enhance_mrz_image(
+        image: np.ndarray,
+        *,
+        binarize: bool = False,
+    ) -> np.ndarray:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        enhanced = cv2.createCLAHE(
-            clipLimit=3.0, tileGridSize=(8, 8)
-        ).apply(gray)
-        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        # Soft glare compression keeps bright reflections from washing out MRZ.
+        if int(gray.max()) - int(gray.min()) > 5:
+            gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8)).apply(gray)
+        # Unsharp mask helps thin OCR-B fillers like "<".
+        blurred = cv2.GaussianBlur(clahe, (0, 0), 1.2)
+        sharp = cv2.addWeighted(clahe, 1.6, blurred, -0.6, 0)
+        if binarize:
+            binary = cv2.adaptiveThreshold(
+                sharp,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                11,
+            )
+            # Slightly thicken strokes so Paddle keeps seeing "<".
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+            return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
+
+    @classmethod
+    def upscale_mrz_if_needed(
+        cls,
+        image: np.ndarray,
+        min_width: int | None = None,
+    ) -> np.ndarray:
+        target_width = cls.MIN_MRZ_OCR_WIDTH if min_width is None else min_width
+        height, width = image.shape[:2]
+        if width >= target_width:
+            return image
+        scale = target_width / max(width, 1)
+        return cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_CUBIC,
+        )
 
     @classmethod
     def detect_mrz_roi(cls, image: np.ndarray) -> np.ndarray | None:
@@ -138,16 +202,17 @@ class ImagePreprocessor:
             width_ratio = candidate_width / resized_width
             aspect_ratio = candidate_width / candidate_height
             bottom_position = (y + candidate_height) / resized_height
+            # MRZ sits in the lower band; ignore upper prose blocks.
             if (
-                width_ratio < 0.35
-                or aspect_ratio < 2.5
-                or bottom_position < 0.55
+                width_ratio < 0.30
+                or aspect_ratio < 2.2
+                or bottom_position < 0.50
             ):
                 continue
             score = (
                 width_ratio * 3
                 + min(aspect_ratio, 10) / 10
-                + bottom_position
+                + bottom_position * 2.5
             )
             candidates.append(
                 (
@@ -211,7 +276,7 @@ class ImagePreprocessor:
     @classmethod
     def detect_card_roi(cls, image: np.ndarray) -> np.ndarray:
         height, width = image.shape[:2]
-        target_height = 600
+        target_height = 800
         scale = min(1.0, target_height / height)
         resized = cv2.resize(
             image,
@@ -219,22 +284,26 @@ class ImagePreprocessor:
         )
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blurred, 50, 150)
+        edged = cv2.Canny(blurred, 40, 140)
+        # Close gaps so textured backgrounds don't fragment the card outline.
+        edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+
         contours, _ = cv2.findContours(
             edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         resized_area = resized.shape[0] * resized.shape[1]
-        card_contour = None
-        rectangular_candidate = None
-        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        best_quad: np.ndarray | None = None
+        best_score = 0.0
+        best_box: np.ndarray | None = None
+        best_box_score = 0.0
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:30]:
             contour_area = cv2.contourArea(contour)
-            if contour_area < 0.15 * resized_area:
+            area_ratio = contour_area / resized_area
+            if area_ratio < cls.CARD_MIN_AREA_RATIO:
                 continue
             perimeter = cv2.arcLength(contour, True)
             approximate = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-            if len(approximate) == 4:
-                card_contour = approximate
-                break
             rotated_rectangle = cv2.minAreaRect(contour)
             rectangle_width, rectangle_height = rotated_rectangle[1]
             if min(rectangle_width, rectangle_height) <= 0:
@@ -242,19 +311,26 @@ class ImagePreprocessor:
             aspect_ratio = max(rectangle_width, rectangle_height) / min(
                 rectangle_width, rectangle_height
             )
+            if not 1.2 <= aspect_ratio <= 2.2:
+                continue
             rectangularity = contour_area / (
                 rectangle_width * rectangle_height
             )
-            if 1.25 <= aspect_ratio <= 2.0 and rectangularity >= 0.65:
-                rectangular_candidate = cv2.boxPoints(rotated_rectangle)
-                break
+            score = area_ratio * 2 + rectangularity
+            if len(approximate) == 4 and rectangularity >= 0.55:
+                if score > best_score:
+                    best_score = score
+                    best_quad = approximate.reshape(4, 2)
+            if rectangularity >= 0.55 and score > best_box_score:
+                best_box_score = score
+                best_box = cv2.boxPoints(rotated_rectangle)
 
-        if card_contour is None:
-            if rectangular_candidate is None:
-                return image
-            contour_points = rectangular_candidate
+        if best_quad is not None:
+            contour_points = best_quad
+        elif best_box is not None:
+            contour_points = best_box
         else:
-            contour_points = card_contour.reshape(4, 2)
+            return image
 
         rectangle = cls.order_points(contour_points / scale)
         top_left, top_right, bottom_right, bottom_left = rectangle

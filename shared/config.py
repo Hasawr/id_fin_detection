@@ -34,6 +34,7 @@ class Settings:
     max_upload_bytes: int
     max_image_pixels: int
     max_batch_files: int
+    ocr_max_concurrency: int
     audit_db_path: Path
     audit_payload_dir: Path
 
@@ -52,6 +53,10 @@ def get_settings() -> Settings:
         max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
         max_image_pixels=int(os.getenv("MAX_IMAGE_PIXELS", "25000000")),
         max_batch_files=int(os.getenv("MAX_BATCH_FILES", "10")),
+        ocr_max_concurrency=max(
+            1,
+            int(os.getenv("OCR_MAX_CONCURRENCY", "2")),
+        ),
         audit_db_path=_resolve_path(
             os.getenv("AUDIT_DB_PATH", str(DEFAULT_AUDIT_DB_PATH)),
             DEFAULT_AUDIT_DB_PATH,
