@@ -26,9 +26,12 @@ router = APIRouter(prefix="/v1", tags=["id-fin"])
         "when the value can be validated."
     ),
     responses={
+        400: {"description": "Empty upload"},
         401: {"description": "Missing or invalid API key"},
         413: {"description": "Upload too large"},
-        422: {"description": "Invalid or unsupported image"},
+        415: {"description": "Unsupported image type"},
+        422: {"description": "Invalid image content"},
+        500: {"description": "OCR engine failed to process the image"},
     },
 )
 async def detect_id_fin(
@@ -59,9 +62,12 @@ async def detect_id_fin(
         "`OCR_MAX_CONCURRENCY` GPU workers."
     ),
     responses={
+        400: {"description": "An uploaded image is empty"},
         401: {"description": "Missing or invalid API key"},
         413: {"description": "Too many files or upload too large"},
-        422: {"description": "Invalid or unsupported image"},
+        415: {"description": "Unsupported image type"},
+        422: {"description": "Invalid image content"},
+        500: {"description": "OCR engine failed to process an image"},
     },
 )
 async def detect_id_fin_batch(

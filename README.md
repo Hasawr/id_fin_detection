@@ -137,6 +137,10 @@ before OCR. A batch accepts at most `MAX_BATCH_FILES` images (20 on the core
 PC example above). Uploaded files are stored in a request-specific temporary
 directory and removed after processing.
 
+`/health` reports configured OCR capacity without loading GPU models. A valid
+image where no FIN can be found returns `200` with `fin: null`; an OCR engine
+failure returns `500` with error code `ocr_processing_failed`.
+
 ## Project structure
 
 ```text

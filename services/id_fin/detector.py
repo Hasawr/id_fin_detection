@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 _DLL_DIRECTORY_HANDLES: list[object] = []
 
 
+class OCRProcessingError(RuntimeError):
+    """Raised when the OCR engine cannot complete an image."""
+
+
 @dataclass(frozen=True)
 class OCRAttempt:
     name: str
@@ -138,13 +142,11 @@ class FINDetector:
                 mrz_result=mrz_result,
                 notes=notes,
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Error processing MRZ image %s", image_path.name)
-            return FINDetectionOutput(
-                fin=None,
-                confidence=0.0,
-                notes=["Failed to process MRZ image."],
-            )
+            raise OCRProcessingError(
+                f"Failed to process MRZ image {image_path.name}."
+            ) from exc
 
     def _build_attempts(self, rectified) -> list[OCRAttempt]:
         deskewed_cache: dict[str, object] = {}

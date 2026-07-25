@@ -10,6 +10,15 @@ from shared.config import Settings, get_settings
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+def _keys_match(supplied_key: str, expected_key: str) -> bool:
+    supplied_bytes = supplied_key.encode("utf-8")
+    expected_bytes = expected_key.encode("utf-8")
+    return (
+        len(supplied_bytes) == len(expected_bytes)
+        and hmac.compare_digest(supplied_bytes, expected_bytes)
+    )
+
+
 def require_api_key(
     supplied_key: Annotated[str | None, Security(api_key_header)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -20,10 +29,11 @@ def require_api_key(
             detail="API authentication is not configured.",
         )
 
-    if supplied_key is None or not any(
-        hmac.compare_digest(supplied_key, expected_key)
+    is_valid_key = supplied_key is not None and any(
+        _keys_match(supplied_key, expected_key)
         for expected_key in settings.api_keys
-    ):
+    )
+    if not is_valid_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid API key.",

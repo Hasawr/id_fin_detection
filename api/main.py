@@ -1,10 +1,14 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
+from fastapi.responses import JSONResponse
 
 from api.middleware.audit import AuditMiddleware
 from api.routes import health, id_fin, passport
+from api.schemas import ErrorDetail, IdFinResponse
+from services.id_fin.detector import OCRProcessingError
+from services.id_fin.service import get_id_fin_service
 from shared.audit import get_audit_store
 
 
@@ -17,7 +21,12 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.audit_store = get_audit_store()
-    yield
+    try:
+        yield
+    finally:
+        if get_id_fin_service.cache_info().currsize:
+            get_id_fin_service().close()
+            get_id_fin_service.cache_clear()
 
 
 app = FastAPI(
@@ -48,6 +57,27 @@ app = FastAPI(
     ],
 )
 app.add_middleware(AuditMiddleware)
+
+
+@app.exception_handler(OCRProcessingError)
+async def handle_ocr_processing_error(
+    request: Request,
+    exc: OCRProcessingError,
+) -> JSONResponse:
+    del request, exc
+    response = IdFinResponse(
+        service="id-fin",
+        error=ErrorDetail(
+            code="ocr_processing_failed",
+            message="The OCR engine could not process the image.",
+        ),
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=response.model_dump(),
+    )
+
+
 app.include_router(health.router)
 app.include_router(id_fin.router)
 app.include_router(passport.router)

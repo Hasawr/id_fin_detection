@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from api.schemas import HealthResponse
-from services.id_fin.service import IDFinService, get_id_fin_service
+from shared.config import Settings, get_settings
 
 
 router = APIRouter(tags=["health"])
@@ -18,11 +18,10 @@ router = APIRouter(tags=["health"])
     ),
 )
 def health(
-    service: Annotated[IDFinService, Depends(get_id_fin_service)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> HealthResponse:
-    concurrency = service.concurrency_info()
     return HealthResponse(
-        services=["id-fin", "passport"],
-        ocr_max_concurrency=int(concurrency["max_concurrency"]),
-        ocr_available_workers=int(concurrency["available_workers"]),
+        services=["id-fin"],
+        ocr_max_concurrency=settings.ocr_max_concurrency,
+        ocr_available_workers=None,
     )

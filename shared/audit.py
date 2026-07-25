@@ -12,7 +12,6 @@ import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs
 
 
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -584,13 +583,6 @@ class AuditStore:
         if hours is None:
             return "", []
         return "WHERE created_at >= ?", [self._cutoff_iso(hours)]
-
-
-def parse_query_string(query: str | None) -> dict[str, list[str]]:
-    if not query:
-        return {}
-    return parse_qs(query, keep_blank_values=True)
-
 
 _store: AuditStore | None = None
 _store_lock = threading.Lock()

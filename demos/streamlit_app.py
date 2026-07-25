@@ -1,7 +1,7 @@
+import asyncio
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import streamlit as st
@@ -13,8 +13,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from audit_dashboard import render_integration_audit
 from services.id_fin import FINDetectionOutput
-from services.id_fin.detector import FINDetector
-from services.id_fin.service import DetectorPool
+from services.id_fin.detector import OCRProcessingError
+from services.id_fin.service import IDFinService
 from shared.config import get_settings
 
 
@@ -36,73 +36,63 @@ RESULT_SCHEMA_VERSION = 9
 
 
 @st.cache_resource
-def get_detector(use_gpu: bool) -> FINDetector:
-    return FINDetector(use_gpu=use_gpu, debug=False)
-
-
-@st.cache_resource
-def get_detector_pool(use_gpu: bool, workers: int) -> DetectorPool:
-    return DetectorPool(
-        workers,
-        lambda: FINDetector(use_gpu=use_gpu, debug=False),
+def get_ocr_service(use_gpu: bool, workers: int) -> IDFinService:
+    return IDFinService(
+        use_gpu=use_gpu,
+        max_concurrency=workers,
     )
 
 
 def clear_detection_results() -> None:
     st.session_state.pop("detected_results", None)
-    st.session_state.pop("processing_seconds", None)
     st.session_state.pop("batch_stats", None)
 
 
-def detect_one_with_pool(
-    pool: DetectorPool,
-    image_path: Path,
-) -> FINDetectionOutput:
-    with pool.acquire() as detector:
-        return detector.detect_from_mrz(image_path)
+def clear_ocr_runtime() -> None:
+    clear_detection_results()
+    get_ocr_service.clear()
 
 
-def process_parallel(
-    pool: DetectorPool,
+def has_processing_error(result: FINDetectionOutput) -> bool:
+    return any(note.startswith("Processing error:") for note in result.notes)
+
+
+async def process_jobs(
+    service: IDFinService,
     jobs: list[tuple[str, bytes, Path]],
+    *,
+    parallel: bool,
 ) -> list[tuple[str, bytes, FINDetectionOutput, float]]:
-    results: list[tuple[str, bytes, FINDetectionOutput, float] | None] = [
-        None
-    ] * len(jobs)
-
-    def run_job(
-        index: int,
+    async def run_job(
         file_name: str,
         image_bytes: bytes,
         image_path: Path,
-    ) -> tuple[int, str, bytes, FINDetectionOutput, float]:
+    ) -> tuple[str, bytes, FINDetectionOutput, float]:
         started = time.perf_counter()
-        detection = detect_one_with_pool(pool, image_path)
+        try:
+            detection = await service.process_detection(image_path=image_path)
+        except OCRProcessingError as exc:
+            detection = FINDetectionOutput(
+                fin=None,
+                confidence=0.0,
+                notes=[f"Processing error: {exc}"],
+            )
         elapsed = time.perf_counter() - started
-        return index, file_name, image_bytes, detection, elapsed
+        return file_name, image_bytes, detection, elapsed
 
-    with ThreadPoolExecutor(max_workers=pool.size) as executor:
-        futures = [
-            executor.submit(run_job, index, file_name, image_bytes, image_path)
-            for index, (file_name, image_bytes, image_path) in enumerate(jobs)
-        ]
-        for future in as_completed(futures):
-            index, file_name, image_bytes, detection, elapsed = future.result()
-            results[index] = (file_name, image_bytes, detection, elapsed)
+    if parallel:
+        return list(
+            await asyncio.gather(
+                *(
+                    run_job(file_name, image_bytes, image_path)
+                    for file_name, image_bytes, image_path in jobs
+                )
+            )
+        )
 
-    return [item for item in results if item is not None]
-
-
-def process_sequential(
-    detector: FINDetector,
-    jobs: list[tuple[str, bytes, Path]],
-) -> list[tuple[str, bytes, FINDetectionOutput, float]]:
-    results = []
+    results: list[tuple[str, bytes, FINDetectionOutput, float]] = []
     for file_name, image_bytes, image_path in jobs:
-        started = time.perf_counter()
-        detection = detector.detect_from_mrz(image_path)
-        elapsed = time.perf_counter() - started
-        results.append((file_name, image_bytes, detection, elapsed))
+        results.append(await run_job(file_name, image_bytes, image_path))
     return results
 
 
@@ -115,7 +105,12 @@ def build_batch_stats(
 ) -> dict[str, object]:
     per_image = [elapsed for *_, elapsed in timed_results]
     detected = sum(1 for _, _, result, _ in timed_results if result.fin)
-    failed = len(timed_results) - detected
+    errors = sum(
+        1
+        for _, _, result, _ in timed_results
+        if has_processing_error(result)
+    )
+    not_found = len(timed_results) - detected - errors
     sum_serial = sum(per_image)
     throughput = (
         len(timed_results) / total_seconds if total_seconds > 0 else 0.0
@@ -126,14 +121,11 @@ def build_batch_stats(
         "workers": workers,
         "total_images": len(timed_results),
         "detected": detected,
-        "failed": failed,
+        "not_found": not_found,
+        "errors": errors,
         "total_seconds": total_seconds,
-        "sum_per_image_seconds": sum_serial,
         "throughput": throughput,
         "speedup_vs_serial_sum": speedup,
-        "avg_per_image_seconds": (
-            sum_serial / len(timed_results) if timed_results else 0.0
-        ),
     }
 
 
@@ -145,8 +137,7 @@ def render_id_fin_demo() -> None:
 
     if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
         clear_detection_results()
-        get_detector.clear()
-        get_detector_pool.clear()
+        get_ocr_service.clear()
         st.session_state["result_schema_version"] = RESULT_SCHEMA_VERSION
 
     settings = get_settings()
@@ -155,7 +146,11 @@ def render_id_fin_demo() -> None:
     st.subheader("Runtime")
     runtime_cols = st.columns([1, 1.2, 1])
     with runtime_cols[0]:
-        use_gpu = st.checkbox("Use GPU", value=True)
+        use_gpu = st.checkbox(
+            "Use GPU",
+            value=settings.use_gpu,
+            on_change=clear_ocr_runtime,
+        )
     with runtime_cols[1]:
         parallel_batch = st.checkbox(
             "Parallel batch processing",
@@ -177,7 +172,7 @@ def render_id_fin_demo() -> None:
             help=(
                 f"From .env OCR_MAX_CONCURRENCY={default_workers} on this machine."
             ),
-            on_change=clear_detection_results,
+            on_change=clear_ocr_runtime,
         )
     st.caption(
         f"Service defaults: concurrency={settings.ocr_max_concurrency}, "
@@ -191,6 +186,9 @@ def render_id_fin_demo() -> None:
         on_change=clear_detection_results,
     )
 
+    has_too_many_files = bool(
+        mrz_files and len(mrz_files) > settings.max_batch_files
+    )
     if mrz_files:
         st.caption(
             f"{len(mrz_files)} file(s) selected"
@@ -200,11 +198,10 @@ def render_id_fin_demo() -> None:
                 else " · sequential"
             )
         )
-        if len(mrz_files) > settings.max_batch_files:
-            st.warning(
-                f"API batch limit is {settings.max_batch_files} images. "
-                "The demo can still run locally, but production "
-                "`/v1/id-fin/batch` would reject this many files."
+        if has_too_many_files:
+            st.error(
+                f"Select at most {settings.max_batch_files} images, matching "
+                "the production batch limit."
             )
 
     process_label = (
@@ -215,7 +212,7 @@ def render_id_fin_demo() -> None:
     if st.button(
         process_label,
         type="primary",
-        disabled=not mrz_files,
+        disabled=not mrz_files or has_too_many_files,
     ):
         with tempfile.TemporaryDirectory(prefix="ocr-demo-") as directory:
             temporary_directory = Path(directory)
@@ -230,23 +227,25 @@ def render_id_fin_demo() -> None:
                 jobs.append((mrz_file.name, image_bytes, mrz_path))
 
             started_at = time.perf_counter()
+            service = get_ocr_service(use_gpu, int(workers))
             if parallel_batch:
                 with st.spinner(
                     f"Running {len(jobs)} images on {int(workers)} GPU workers…"
                 ):
-                    pool = get_detector_pool(use_gpu, int(workers))
-                    timed_results = process_parallel(pool, jobs)
+                    timed_results = asyncio.run(
+                        process_jobs(service, jobs, parallel=True)
+                    )
             else:
                 with st.spinner(f"Running {len(jobs)} images sequentially…"):
-                    detector = get_detector(use_gpu)
-                    timed_results = process_sequential(detector, jobs)
+                    timed_results = asyncio.run(
+                        process_jobs(service, jobs, parallel=False)
+                    )
             total_seconds = time.perf_counter() - started_at
 
         st.session_state["detected_results"] = [
             (file_name, image_bytes, result, elapsed)
             for file_name, image_bytes, result, elapsed in timed_results
         ]
-        st.session_state["processing_seconds"] = total_seconds
         st.session_state["batch_stats"] = build_batch_stats(
             timed_results,
             total_seconds=total_seconds,
@@ -270,15 +269,16 @@ def render_id_fin_demo() -> None:
     )
 
     st.subheader("Batch summary")
-    metric_cols = st.columns(5)
+    metric_cols = st.columns(6)
     metric_cols[0].metric("Images", int(batch_stats["total_images"]))
     metric_cols[1].metric("Detected", int(batch_stats["detected"]))
-    metric_cols[2].metric("Not found", int(batch_stats["failed"]))
-    metric_cols[3].metric(
+    metric_cols[2].metric("Not found", int(batch_stats["not_found"]))
+    metric_cols[3].metric("Errors", int(batch_stats["errors"]))
+    metric_cols[4].metric(
         "Throughput",
         f"{float(batch_stats['throughput']):.2f}/s",
     )
-    metric_cols[4].metric(
+    metric_cols[5].metric(
         "Wall time",
         f"{float(batch_stats['total_seconds']):.2f}s",
     )
@@ -320,7 +320,11 @@ def render_id_fin_demo() -> None:
                 "Method": mrz_result.method if mrz_result else "not_found",
                 "Confidence": round(float(result.confidence), 4),
                 "Seconds": round(elapsed, 3),
-                "Status": "ok" if result.fin else "miss",
+                "Status": (
+                    "error"
+                    if has_processing_error(result)
+                    else ("ok" if result.fin else "miss")
+                ),
             }
         )
     st.dataframe(
@@ -390,7 +394,9 @@ def render_id_fin_demo() -> None:
                 )
 
             with result_column:
-                if result.fin:
+                if has_processing_error(result):
+                    st.error(result.notes[-1])
+                elif result.fin:
                     st.success("MRZ and FIN detected")
                 else:
                     failure_message = (

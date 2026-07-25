@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+from services.id_fin.detector import OCRProcessingError
 from services.id_fin.service import get_id_fin_service
 from shared.audit import get_audit_store, reset_audit_store
 from shared.config import Settings, get_settings
@@ -89,10 +90,21 @@ def test_health_does_not_require_authentication(client) -> None:
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
-        "services": ["id-fin", "passport"],
+        "services": ["id-fin"],
         "ocr_max_concurrency": 2,
-        "ocr_available_workers": 2,
+        "ocr_available_workers": None,
     }
+
+
+def test_health_does_not_initialize_ocr_service(client) -> None:
+    test_client, _ = client
+
+    def fail_if_initialized():
+        raise AssertionError("Health must not initialize OCR workers.")
+
+    app.dependency_overrides[get_id_fin_service] = fail_if_initialized
+    response = test_client.get("/health")
+    assert response.status_code == 200
 
 
 def test_health_is_not_audited(client) -> None:
@@ -291,6 +303,55 @@ def test_id_fin_rejects_invalid_api_key(client) -> None:
     assert len(events) == 1
     assert events[0].success is False
     assert events[0].status_code == 401
+
+
+def test_id_fin_rejects_different_length_api_key(client) -> None:
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "x"},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+    assert response.status_code == 401
+
+
+def test_id_fin_rejects_unsupported_image_type(client) -> None:
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "test-key"},
+        files={"mrz": ("id.gif", b"GIF89a", "image/gif")},
+    )
+    assert response.status_code == 415
+
+
+def test_id_fin_rejects_empty_image(client) -> None:
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "test-key"},
+        files={"mrz": ("id.png", b"", "image/png")},
+    )
+    assert response.status_code == 400
+
+
+def test_id_fin_reports_ocr_engine_failure(client) -> None:
+    test_client, _ = client
+
+    class FailingIDFinService:
+        async def process(self, *, image_path: Path) -> dict[str, object]:
+            del image_path
+            raise OCRProcessingError("engine failed")
+
+    app.dependency_overrides[get_id_fin_service] = FailingIDFinService
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "test-key"},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "ocr_processing_failed"
 
 
 def test_id_fin_rejects_invalid_image_content(client) -> None:

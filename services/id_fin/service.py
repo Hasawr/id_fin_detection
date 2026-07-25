@@ -6,9 +6,9 @@ import asyncio
 import logging
 from pathlib import Path
 from queue import Queue
-from typing import Iterator
+from typing import Callable, Iterator
 
-from shared.config import get_settings
+from shared.config import Settings, get_settings
 from services.id_fin import FINDetectionOutput
 from services.id_fin.detector import FINDetector
 
@@ -28,7 +28,11 @@ def serialize_fin_detection(
 class DetectorPool:
     """Fixed pool of GPU OCR engines for bounded parallel inference."""
 
-    def __init__(self, size: int, factory) -> None:
+    def __init__(
+        self,
+        size: int,
+        factory: Callable[[], FINDetector],
+    ) -> None:
         if size < 1:
             raise ValueError("Detector pool size must be at least 1.")
         self.size = size
@@ -60,13 +64,24 @@ class IDFinService:
     free worker instead of overloading GPU memory.
     """
 
-    def __init__(self) -> None:
-        settings = get_settings()
-        self.max_concurrency = settings.ocr_max_concurrency
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        use_gpu: bool | None = None,
+        max_concurrency: int | None = None,
+    ) -> None:
+        settings = settings or get_settings()
+        self.max_concurrency = (
+            max_concurrency
+            if max_concurrency is not None
+            else settings.ocr_max_concurrency
+        )
+        detector_uses_gpu = settings.use_gpu if use_gpu is None else use_gpu
         self._pool = DetectorPool(
             self.max_concurrency,
             lambda: FINDetector(
-                use_gpu=settings.use_gpu,
+                use_gpu=detector_uses_gpu,
                 debug=settings.debug,
             ),
         )
@@ -84,8 +99,20 @@ class IDFinService:
         *,
         image_path: Path,
     ) -> dict[str, object]:
-        results = await self.process_many(image_paths=[image_path])
-        return results[0]
+        result = await self.process_detection(image_path=image_path)
+        return serialize_fin_detection(result)
+
+    async def process_detection(
+        self,
+        *,
+        image_path: Path,
+    ) -> FINDetectionOutput:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            self._detect_one,
+            image_path,
+        )
 
     async def process_many(
         self,
@@ -95,22 +122,21 @@ class IDFinService:
         if not image_paths:
             return []
 
-        loop = asyncio.get_running_loop()
         tasks = [
-            loop.run_in_executor(
-                self._executor,
-                self._detect_one,
-                image_path,
-            )
+            self.process_detection(image_path=image_path)
             for image_path in image_paths
         ]
-        return list(await asyncio.gather(*tasks))
+        return [
+            serialize_fin_detection(result)
+            for result in await asyncio.gather(*tasks)
+        ]
 
-    def _detect_one(self, image_path: Path) -> dict[str, object]:
+    def _detect_one(self, image_path: Path) -> FINDetectionOutput:
         with self._pool.acquire() as detector:
-            return serialize_fin_detection(
-                detector.detect_from_mrz(image_path)
-            )
+            return detector.detect_from_mrz(image_path)
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def concurrency_info(self) -> dict[str, object]:
         pool_stats = self._pool.stats()

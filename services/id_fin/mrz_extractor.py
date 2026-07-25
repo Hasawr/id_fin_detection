@@ -13,6 +13,7 @@ from .layout import (
     TD1_SERIAL_CHECK,
     TD1_SERIAL_LENGTH,
     TD1_SERIAL_SEARCH_STARTS,
+    TD2_COMPOSITE_CHECK,
     TD2_FIN,
     TD2_FIN_AFTER_NATIONALITY,
     TD2_FIN_LENGTH,
@@ -285,6 +286,7 @@ class MRZExtractor:
         (line1, confidence1), (line2, confidence2) = pair
         fields = cls._extract_td2_fields(line2)
         checksum_valid = fields["checksum_valid"]
+        composite_checksum_valid = fields["composite_checksum_valid"]
         fin_valid = is_valid_fin(fields["fin"] or "")
         serial_valid = bool(fields["checksum_valid"]) and is_valid_old_card_serial(
             fields["serial"] or ""
@@ -295,6 +297,7 @@ class MRZExtractor:
             + min(len(line2), TD2_LINE_LENGTH) / 2
             + (20 if cls._looks_like_td2_second_line(line2) else 0)
             + (25 if checksum_valid else 0)
+            + (15 if composite_checksum_valid else 0)
             + (30 if fin_valid else 0)
             + (10 if serial_valid else 0)
             + ((confidence1 + confidence2) / 2) * 20
@@ -377,10 +380,24 @@ class MRZExtractor:
             else nationality_index + TD2_FIN_AFTER_NATIONALITY
         )
         fin = cls._recover_td2_fin(normalized, fin_start)
+        composite_check = correct_ocr_digits(
+            TD2_COMPOSITE_CHECK.read(normalized)
+        )
+        composite_data = (
+            normalized[0:10]
+            + normalized[13:20]
+            + normalized[21:35]
+        )
+        composite_checksum_valid = (
+            composite_check.isdigit()
+            and compute_mrz_check_digit(composite_data)
+            == int(composite_check)
+        )
         return {
             "fin": fin,
             "serial": serial,
             "checksum_valid": checksum_valid,
+            "composite_checksum_valid": composite_checksum_valid,
             "nationality_index": nationality_index,
         }
 
@@ -571,6 +588,17 @@ class MRZExtractor:
                         )
         return candidates
 
+    @staticmethod
+    def _td1_serial_checksum_valid(line1: str) -> bool:
+        serial_field = TD1_SERIAL.read(line1)
+        check_digit = correct_ocr_digits(TD1_SERIAL_CHECK.read(line1))
+        if len(serial_field) != TD1_SERIAL.length or not check_digit.isdigit():
+            return False
+        corrected_serial = (
+            serial_field[:2] + correct_ocr_digits(serial_field[2:])
+        )
+        return compute_mrz_check_digit(corrected_serial) == int(check_digit)
+
     @classmethod
     def _score_td1_candidate(
         cls,
@@ -581,12 +609,7 @@ class MRZExtractor:
             confidence3,
         ) = lines
         normalized_line1 = cls._normalize_length(line1, TD1_LINE_LENGTH)
-        serial_check = TD1_SERIAL_CHECK.read(normalized_line1)
-        checksum_valid = (
-            serial_check.isdigit()
-            and compute_mrz_check_digit(TD1_SERIAL.read(normalized_line1))
-            == int(serial_check)
-        )
+        checksum_valid = cls._td1_serial_checksum_valid(normalized_line1)
         nationality_index = line2.find("AZE", 12, 20)
         serial_valid = cls._extract_new_card_serial_number(line1) is not None
         return (
@@ -670,12 +693,7 @@ class MRZExtractor:
             issuing_state = "AZE"
 
         fin_candidate = self._extract_td1_fin(line1, issuing_state)
-        serial_check = TD1_SERIAL_CHECK.read(line1)
-        checksum_valid = (
-            serial_check.isdigit()
-            and compute_mrz_check_digit(TD1_SERIAL.read(line1))
-            == int(serial_check)
-        )
+        checksum_valid = self._td1_serial_checksum_valid(line1)
         confidence = (
             (line1_confidence + line2_confidence + line3_confidence) / 3.0
             if all(

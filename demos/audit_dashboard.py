@@ -90,11 +90,6 @@ def pill_html(badge: str) -> str:
     return f'<span class="pill {pill_class(badge)}">{safe}</span>'
 
 
-def is_fin_not_found(event: AuditEvent) -> bool:
-    summary = (event.result_summary or "").lower()
-    return "fin not found" in summary or "no fin found" in summary
-
-
 def extracted_fields(event: AuditEvent) -> tuple[str, str]:
     body = event.response_body
     if not isinstance(body, dict):

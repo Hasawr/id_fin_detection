@@ -26,6 +26,25 @@ def _resolve_path(value: str, default: Path) -> Path:
     return path
 
 
+def _bounded_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer.") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}."
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     api_keys: tuple[str, ...]
@@ -52,10 +71,17 @@ def get_settings() -> Settings:
         debug=_as_bool(os.getenv("DEBUG")),
         max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
         max_image_pixels=int(os.getenv("MAX_IMAGE_PIXELS", "25000000")),
-        max_batch_files=int(os.getenv("MAX_BATCH_FILES", "10")),
-        ocr_max_concurrency=max(
-            1,
-            int(os.getenv("OCR_MAX_CONCURRENCY", "2")),
+        max_batch_files=_bounded_int(
+            "MAX_BATCH_FILES",
+            20,
+            minimum=1,
+            maximum=1_000,
+        ),
+        ocr_max_concurrency=_bounded_int(
+            "OCR_MAX_CONCURRENCY",
+            2,
+            minimum=1,
+            maximum=32,
         ),
         audit_db_path=_resolve_path(
             os.getenv("AUDIT_DB_PATH", str(DEFAULT_AUDIT_DB_PATH)),
