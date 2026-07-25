@@ -6,10 +6,19 @@ from services.id_fin import FINDetectionOutput, MRZResult
 from services.id_fin.detector import FINDetector
 from services.id_fin.preprocessor import ImagePreprocessor
 from services.id_fin.service import serialize_fin_detection
+from services.id_fin.layout import (
+    TD1_FIN,
+    TD1_SERIAL,
+    TD2_FIN,
+    TD2_SERIAL,
+)
 from services.id_fin.validator import (
     clean_mrz_line,
     compute_mrz_check_digit,
+    correct_ocr_digits,
     is_valid_fin,
+    is_valid_new_card_serial,
+    is_valid_old_card_serial,
 )
 from services.id_fin.mrz_extractor import MRZExtractor
 
@@ -22,6 +31,24 @@ def test_check_digit() -> None:
 def test_fin_validation() -> None:
     assert is_valid_fin("7ABC123")
     assert not is_valid_fin("TOO-LONG")
+
+
+def test_ocr_digit_confusion_and_serial_validation() -> None:
+    assert correct_ocr_digits("12OIZSB") == "1201258"
+    assert is_valid_old_card_serial("19205792")
+    assert not is_valid_old_card_serial("AA2039827")
+    assert is_valid_new_card_serial("AA2039827")
+    assert not is_valid_new_card_serial("19205792")
+
+
+def test_fixed_mrz_positions_for_fin_and_serial() -> None:
+    new_line1 = "IAAZEAA203982795H0H4NX<<<<<<<<"
+    old_line2 = "19205792<7AZE8210276M32102712BDLLON5"
+
+    assert TD1_SERIAL.read(new_line1) == "AA2039827"
+    assert TD1_FIN.read(new_line1) == "5H0H4NX"
+    assert TD2_SERIAL.read(old_line2).replace("<", "") == "19205792"
+    assert TD2_FIN.read(old_line2) == "2BDLLON"
 
 
 def test_mrz_cleanup() -> None:
@@ -43,6 +70,7 @@ def test_old_card_td2_fin_extraction() -> None:
     result = extractor._parse_td2(pair, is_cropped=False)
     assert result.fin == "1HNLXEM"
     assert result.card_type == "older_card"
+    assert result.card_serial_number == "14433235"
     assert result.checksum_valid is True
     assert result.line3 == ""
 
@@ -74,7 +102,7 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
     )
     assert old_card.fin == "2BDLLON"
     assert old_card.card_type == "older_card"
-    assert old_card.card_serial_number is None
+    assert old_card.card_serial_number == "19205792"
     assert len(old_card.line1) == 36
     assert len(old_card.line2) == 36
     assert old_card.line3 == ""
@@ -206,6 +234,17 @@ def test_new_card_serial_number_requires_aa_or_ab_and_seven_digits() -> None:
         extractor._extract_new_card_serial_number(
             "IAAZEAA123O567<<<<<<<<<<<<<<<<"
         )
+        == "AA1230567"
+    )
+
+
+def test_new_card_serial_rejects_non_digit_noise_that_cannot_be_corrected() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+
+    assert (
+        extractor._extract_new_card_serial_number(
+            "IAAZEAA123X567<<<<<<<<<<<<<<<<"
+        )
         is None
     )
 
@@ -230,7 +269,7 @@ def test_valid_td1_fin_does_not_require_perfect_serial_ocr() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
     result = extractor._parse_td1(
         [
-            ("IAAZEAA123O5670AZE1ABC234<<<<<", 0.90),
+            ("IAAZEAA123X5670AZE1ABC234<<<<<", 0.90),
             ("9001011M3001019AZE<<<<<<<<<<<0", 0.91),
             ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
         ],
@@ -240,6 +279,22 @@ def test_valid_td1_fin_does_not_require_perfect_serial_ocr() -> None:
     assert result.fin == "1ABC234"
     assert result.card_type == "new_card"
     assert result.card_serial_number is None
+
+
+def test_new_card_serial_corrects_ocr_digit_confusion() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td1(
+        [
+            ("IAAZEAA123O5670AZE1ABC234<<<<<", 0.90),
+            ("9001011M3001019AZE<<<<<<<<<<<0", 0.91),
+            ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.92),
+        ],
+        is_cropped=False,
+    )
+
+    assert result.fin == "1ABC234"
+    assert result.card_type == "new_card"
+    assert result.card_serial_number == "AA1230567"
 
 
 def test_valid_td1_tolerates_digit_confusion_in_second_line() -> None:
@@ -271,7 +326,54 @@ def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
     assert pair is not None
     result = extractor._parse_td2(pair, is_cropped=False)
     assert result.fin == "2BDLLON"
+    assert result.card_serial_number == "19205792"
     assert result.card_type == "older_card"
+
+
+def test_older_card_fin_recovers_when_aze_alignment_shifts() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    # Extra OCR character before nationality shifts AZE from index 10 to 11.
+    result = extractor._parse_td2(
+        (
+            ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
+            ("19205792<7XAZE8210276M32102712BDLLON5", 0.99),
+        ),
+        is_cropped=False,
+    )
+
+    assert result.fin == "2BDLLON"
+    assert result.card_type == "older_card"
+    assert result.card_serial_number == "19205792"
+
+
+def test_older_card_tolerates_digit_confusion_in_birth_date() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td2(
+        (
+            ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
+            ("19205792<7AZE82IO276M32102712BDLLON5", 0.99),
+        ),
+        is_cropped=False,
+    )
+
+    assert result.fin == "2BDLLON"
+    assert result.card_type == "older_card"
+    assert result.card_serial_number == "19205792"
+
+
+def test_older_card_serial_corrects_ocr_digit_confusion() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    result = extractor._parse_td2(
+        (
+            ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
+            ("192O5792<7AZE8210276M32102712BDLLON5", 0.99),
+        ),
+        is_cropped=False,
+    )
+
+    assert result.fin == "2BDLLON"
+    assert result.card_serial_number == "19205792"
+    assert result.checksum_valid is True
 
 
 def test_strong_td1_candidate_beats_weak_headerless_td2_candidate() -> None:

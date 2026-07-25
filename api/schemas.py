@@ -50,11 +50,12 @@ class MRZDetails(BaseModel):
     card_serial_number: str | None = Field(
         None,
         description=(
-            "Document serial for new TD1 cards when it matches AA or AB "
-            "followed by seven digits. Null for older TD2 cards or when "
-            "the value cannot be validated."
+            "Document serial from the MRZ. New TD1 cards use AA or AB "
+            "followed by seven digits. Older TD2 cards use the numeric "
+            "document number (typically 7-9 digits). Null when the value "
+            "cannot be validated."
         ),
-        examples=["AA1234567"],
+        examples=["AA1234567", "19205792"],
     )
 
 

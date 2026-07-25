@@ -20,9 +20,10 @@ router = APIRouter(prefix="/v1", tags=["id-fin"])
     summary="Detect FIN and card serial from one MRZ image",
     description=(
         "Upload the MRZ side of an Azerbaijani ID card. "
-        "Returns the personal FIN when detected. For new TD1 cards, "
-        "`mrz_details.card_serial_number` is also returned when it matches "
-        "`AA` or `AB` followed by seven digits."
+        "Returns the personal FIN when detected. "
+        "`mrz_details.card_serial_number` is returned for new TD1 cards "
+        "(`AA`/`AB` + 7 digits) and older TD2 cards (numeric document number) "
+        "when the value can be validated."
     ),
     responses={
         401: {"description": "Missing or invalid API key"},
@@ -52,7 +53,8 @@ async def detect_id_fin(
     description=(
         "Upload one or more MRZ-side images in a single request. "
         "Each result includes `fin`, `confidence`, and `mrz_details` "
-        "(with `card_serial_number` for validated new-card serials). "
+        "(with `card_serial_number` for validated new-card and older-card "
+        "serials). "
         "Images are processed sequentially on the shared GPU."
     ),
     responses={

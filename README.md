@@ -95,8 +95,11 @@ Successful responses use a stable service envelope:
 ```
 
 For new TD1 cards, `mrz_details.card_serial_number` contains the MRZ document
-number when it matches `AA` or `AB` followed by seven digits. It is `null` for
-older TD2 cards or when the value cannot be validated.
+number when it matches `AA` or `AB` followed by seven digits (fixed line-1
+positions 6–14). The FIN is read from optional data starting at position 16.
+For older TD2 cards the numeric document number is at line-2 positions 1–9
+and the FIN is at positions 29–35. It is `null` when the value cannot be
+validated.
 
 For multiple cards, repeat the `mrz` multipart field:
 

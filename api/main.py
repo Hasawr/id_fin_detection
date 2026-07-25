@@ -26,8 +26,9 @@ app = FastAPI(
         "Versioned OCR endpoints for Azerbaijani identity documents.\n\n"
         "**Authentication:** send a configured key in the `X-API-Key` header.\n\n"
         "**ID FIN service:** extracts the personal FIN from the MRZ side of an "
-        "ID card. For new TD1 cards, validated document serials "
-        "(`AA`/`AB` + 7 digits) are returned as `mrz_details.card_serial_number`."
+        "ID card. Validated document serials are returned as "
+        "`mrz_details.card_serial_number` (`AA`/`AB` + 7 digits for new TD1 "
+        "cards; numeric document number for older TD2 cards)."
     ),
     version="1.0.0",
     lifespan=lifespan,

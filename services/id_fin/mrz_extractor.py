@@ -3,7 +3,33 @@ import logging
 import re
 
 from . import MRZResult
-from .validator import clean_mrz_line, compute_mrz_check_digit, is_valid_fin
+from .layout import (
+    TD1_FIN,
+    TD1_FIN_LENGTH,
+    TD1_ISSUING_STATE,
+    TD1_LINE_LENGTH,
+    TD1_OPTIONAL_END,
+    TD1_SERIAL,
+    TD1_SERIAL_CHECK,
+    TD1_SERIAL_LENGTH,
+    TD1_SERIAL_SEARCH_STARTS,
+    TD2_FIN,
+    TD2_FIN_AFTER_NATIONALITY,
+    TD2_FIN_LENGTH,
+    TD2_LINE_LENGTH,
+    TD2_NATIONALITY,
+    TD2_NATIONALITY_ALLOWED,
+    TD2_SERIAL,
+    TD2_SERIAL_CHECK,
+)
+from .validator import (
+    clean_mrz_line,
+    compute_mrz_check_digit,
+    correct_ocr_digits,
+    is_valid_fin,
+    is_valid_new_card_serial,
+    is_valid_old_card_serial,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -165,12 +191,12 @@ class MRZExtractor:
                         )
         for second_index in range(1, len(merged_lines)):
             second = merged_lines[second_index][0]
+            fields = cls._extract_td2_fields(second)
             if (
                 not cls._looks_like_td2_second_line(second)
                 or len(second) < 35
-                or not is_valid_fin(
-                    cls._normalize_length(second, 36)[28:35]
-                )
+                or not is_valid_fin(fields["fin"] or "")
+                or not fields["checksum_valid"]
             ):
                 continue
             first = merged_lines[second_index - 1][0]
@@ -198,49 +224,238 @@ class MRZExtractor:
         has_header: bool,
     ) -> float:
         (line1, confidence1), (line2, confidence2) = pair
-        normalized = cls._normalize_length(line2, 36)
-        checksum_valid = (
-            normalized[9].isdigit()
-            and compute_mrz_check_digit(normalized[:9])
-            == int(normalized[9])
+        fields = cls._extract_td2_fields(line2)
+        checksum_valid = fields["checksum_valid"]
+        fin_valid = is_valid_fin(fields["fin"] or "")
+        serial_valid = bool(fields["checksum_valid"]) and is_valid_old_card_serial(
+            fields["serial"] or ""
         )
-        fin_valid = is_valid_fin(normalized[28:35])
         return (
             (30 if has_header else 10)
-            + min(len(line1), 36) / 3
-            + min(len(line2), 36) / 2
+            + min(len(line1), TD2_LINE_LENGTH) / 3
+            + min(len(line2), TD2_LINE_LENGTH) / 2
             + (20 if cls._looks_like_td2_second_line(line2) else 0)
             + (25 if checksum_valid else 0)
             + (30 if fin_valid else 0)
+            + (10 if serial_valid else 0)
             + ((confidence1 + confidence2) / 2) * 20
         )
 
-    @staticmethod
-    def _looks_like_td2_second_line(line: str) -> bool:
-        nationality_index = line.find("AZE", 8, 15)
-        birth_date = (
+    @classmethod
+    def _td2_nationality_index(cls, line: str) -> int | None:
+        nationality_index = line.find(
+            "AZE",
+            TD2_NATIONALITY.start - 1,
+            TD2_NATIONALITY.end + 2,
+        )
+        if nationality_index in TD2_NATIONALITY_ALLOWED:
+            return nationality_index
+        return None
+
+    @classmethod
+    def _looks_like_td2_second_line(cls, line: str) -> bool:
+        nationality_index = cls._td2_nationality_index(line)
+        if nationality_index is None or len(line) < 25:
+            return False
+        birth_date = correct_ocr_digits(
             line[nationality_index + 3 : nationality_index + 9]
-            if nationality_index >= 0
-            else ""
         )
-        return (
-            nationality_index in {9, 10, 11}
-            and birth_date.isdigit()
-            and len(line) >= 25
+        return birth_date.isdigit()
+
+    @classmethod
+    def _extract_td2_fields(cls, line2: str) -> dict[str, object]:
+        """Read older-card FIN/serial from fixed TD2 positions.
+
+        Primary path uses the never-changing ICAO slots in ``layout.py``.
+        OCR-shift recovery only runs when the fixed nationality mark moves.
+        """
+        normalized = cls._normalize_length(line2, TD2_LINE_LENGTH)
+        nationality_index = cls._td2_nationality_index(normalized)
+        if nationality_index is None:
+            nationality_index = TD2_NATIONALITY.start
+
+        # Fixed serial slot: line2[0:9] + check at [9].
+        document_field = TD2_SERIAL.read(normalized)
+        check_char = TD2_SERIAL_CHECK.read(normalized)
+        digit_document = correct_ocr_digits(document_field)
+        digit_check = correct_ocr_digits(check_char)
+        checksum_valid = (
+            len(digit_check) == 1
+            and digit_check.isdigit()
+            and compute_mrz_check_digit(digit_document)
+            == int(digit_check)
         )
+        if not checksum_valid and nationality_index != TD2_NATIONALITY.start:
+            relative_check_index = nationality_index - 1
+            relative_document = normalized[: max(relative_check_index, 0)]
+            relative_check = (
+                normalized[relative_check_index]
+                if 0 <= relative_check_index < len(normalized)
+                else ""
+            )
+            relative_digit_document = correct_ocr_digits(relative_document)
+            relative_digit_check = correct_ocr_digits(relative_check)
+            if (
+                relative_digit_check.isdigit()
+                and compute_mrz_check_digit(relative_digit_document)
+                == int(relative_digit_check)
+            ):
+                document_field = relative_document
+                check_char = relative_check
+                digit_document = relative_digit_document
+                digit_check = relative_digit_check
+                checksum_valid = True
+
+        serial = cls._extract_old_card_serial_number(
+            digit_document if checksum_valid else document_field,
+            digit_check if checksum_valid else check_char,
+        )
+
+        # Fixed FIN slot is line2[28:35]; if AZE shifted, keep FIN 18 after it.
+        fin_start = (
+            TD2_FIN.start
+            if nationality_index == TD2_NATIONALITY.start
+            else nationality_index + TD2_FIN_AFTER_NATIONALITY
+        )
+        fin = cls._recover_td2_fin(normalized, fin_start)
+        return {
+            "fin": fin,
+            "serial": serial,
+            "checksum_valid": checksum_valid,
+            "nationality_index": nationality_index,
+        }
+
+    @classmethod
+    def _recover_td2_fin(cls, line2: str, expected_start: int) -> str | None:
+        """Prefer the fixed FIN window, then nearby offsets with a check digit."""
+        if expected_start >= 0 and expected_start + TD2_FIN_LENGTH <= len(line2):
+            primary = line2[expected_start : expected_start + TD2_FIN_LENGTH]
+            if is_valid_fin(primary):
+                return primary
+
+        # Offset recovery only when a trailing check digit is present. This
+        # avoids accepting truncated tails like "71SHORT" as a FIN.
+        for offset in (-1, 1, -2, 2):
+            start = expected_start + offset
+            if start < 0 or start + TD2_FIN_LENGTH + 1 > len(line2):
+                continue
+            value = line2[start : start + TD2_FIN_LENGTH]
+            if is_valid_fin(value) and line2[start + TD2_FIN_LENGTH].isdigit():
+                return value
+        return None
+
+    @staticmethod
+    def _extract_old_card_serial_number(
+        document_field: str,
+        check_char: str,
+    ) -> str | None:
+        """Older Azerbaijani TD2 serials are numeric document numbers."""
+        cleaned = document_field.replace("<", "")
+        if not cleaned:
+            return None
+        digit_cleaned = correct_ocr_digits(cleaned)
+        if is_valid_old_card_serial(digit_cleaned):
+            digit_check = correct_ocr_digits(check_char)
+            if digit_check.isdigit():
+                padded = digit_cleaned.ljust(TD2_SERIAL.length, "<")[
+                    : TD2_SERIAL.length
+                ]
+                if compute_mrz_check_digit(padded) == int(digit_check):
+                    return digit_cleaned
+            return digit_cleaned
+        if is_valid_old_card_serial(cleaned):
+            return cleaned
+        return None
 
     @staticmethod
     def _has_document_header(line: str) -> bool:
         return bool(re.match(r"^I(?:<|A)?AZE", line))
 
+    @staticmethod
+    def _extract_new_card_serial_number(line1: str) -> str | None:
+        """Read new-card serial from fixed TD1 position line1[5:14].
+
+        Falls back to nearby starts when OCR drops/inserts a header character.
+        """
+        min_length = max(TD1_SERIAL.end, max(TD1_SERIAL_SEARCH_STARTS) + TD1_SERIAL_LENGTH)
+        normalized = line1 + ("<" * max(0, min_length - len(line1)))
+        candidates: list[tuple[int, str]] = []
+
+        for start in (TD1_SERIAL.start, *TD1_SERIAL_SEARCH_STARTS):
+            chunk = normalized[start : start + TD1_SERIAL_LENGTH]
+            if len(chunk) != TD1_SERIAL_LENGTH:
+                continue
+            if not re.fullmatch(r"A[AB][A-Z0-9]{7}", chunk):
+                continue
+            prefix = chunk[:2]
+            raw_digits = chunk[2:]
+            digits = correct_ocr_digits(raw_digits)
+            serial = f"{prefix}{digits}"
+            if not is_valid_new_card_serial(serial):
+                continue
+            corrections = sum(
+                original != corrected
+                for original, corrected in zip(raw_digits, digits)
+            )
+            score = (
+                (10 - corrections)
+                + (12 if start == TD1_SERIAL.start else 0)
+                + (4 if start in TD1_SERIAL_SEARCH_STARTS else 0)
+                + (3 if raw_digits.isdigit() else 0)
+            )
+            candidates.append((score, serial))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
     @classmethod
     def _has_td1_document_header(cls, line: str) -> bool:
-        serial_match = re.search(r"A[AB]\d{7}", line[:16])
-        return cls._has_document_header(line) or (
-            line.startswith("I")
-            and serial_match is not None
-            and serial_match.start() in {4, 5, 6}
-        )
+        if cls._has_document_header(line):
+            return True
+        if not line.startswith("I"):
+            return False
+        return cls._extract_new_card_serial_number(line) is not None
+
+    @classmethod
+    def _extract_td1_fin(cls, line1: str, issuing_state: str) -> str | None:
+        """Read new-card FIN from fixed optional-data start line1[15:22]."""
+        normalized = cls._normalize_length(line1, TD1_LINE_LENGTH)
+        candidates: list[tuple[int, str]] = []
+
+        # Canonical optional-data window starts at fixed index 15.
+        for offset in (TD1_FIN.start, TD1_FIN.start - 1, TD1_FIN.start + 1, 13, 16):
+            optional_data = normalized[offset:TD1_OPTIONAL_END].rstrip("<")
+            if not optional_data:
+                continue
+            # Common AZE layout: optional data is ``AZE`` + FIN.
+            if (
+                optional_data.startswith(issuing_state)
+                and len(optional_data) >= len(issuing_state) + TD1_FIN_LENGTH
+            ):
+                value = optional_data[
+                    len(issuing_state) : len(issuing_state) + TD1_FIN_LENGTH
+                ]
+                if is_valid_fin(value):
+                    score = 20 if offset == TD1_FIN.start else 14
+                    candidates.append((score, value))
+            # Direct FIN at the fixed optional-data start.
+            direct = optional_data[:TD1_FIN_LENGTH]
+            if is_valid_fin(direct):
+                # Prefer when the window is exactly FIN (no AZE prefix noise).
+                exact = len(optional_data) == TD1_FIN_LENGTH
+                score = (
+                    (18 if exact else 10)
+                    if offset == TD1_FIN.start
+                    else (8 if exact else 4)
+                )
+                candidates.append((score, direct))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
 
     @classmethod
     def _looks_like_td1(cls, lines: list[tuple[str, float]]) -> bool:
@@ -306,11 +521,12 @@ class MRZExtractor:
             line3,
             confidence3,
         ) = lines
-        normalized_line1 = cls._normalize_length(line1, 30)
+        normalized_line1 = cls._normalize_length(line1, TD1_LINE_LENGTH)
+        serial_check = TD1_SERIAL_CHECK.read(normalized_line1)
         checksum_valid = (
-            normalized_line1[14].isdigit()
-            and compute_mrz_check_digit(normalized_line1[5:14])
-            == int(normalized_line1[14])
+            serial_check.isdigit()
+            and compute_mrz_check_digit(TD1_SERIAL.read(normalized_line1))
+            == int(serial_check)
         )
         nationality_index = line2.find("AZE", 12, 20)
         serial_valid = cls._extract_new_card_serial_number(line1) is not None
@@ -318,7 +534,7 @@ class MRZExtractor:
             (30 if cls._has_document_header(line1) else 15)
             + (10 if serial_valid else 0)
             + sum(
-                max(0, 10 - abs(len(line) - 30))
+                max(0, 10 - abs(len(line) - TD1_LINE_LENGTH))
                 for line in (line1, line2, line3)
             )
             + (15 if nationality_index in {14, 15, 16} else 5)
@@ -346,13 +562,14 @@ class MRZExtractor:
             raw_line2,
             line2_confidence,
         ) = pair
-        line1 = self._normalize_length(raw_line1, 36)
-        line2 = self._normalize_length(raw_line2, 36)
-        fin_candidate = line2[28:35]
-        fin = fin_candidate if is_valid_fin(fin_candidate) else None
-        checksum_valid = (
-            line2[9].isdigit()
-            and compute_mrz_check_digit(line2[0:9]) == int(line2[9])
+        line1 = self._normalize_length(raw_line1, TD2_LINE_LENGTH)
+        line2 = self._normalize_length(raw_line2, TD2_LINE_LENGTH)
+        fields = self._extract_td2_fields(line2)
+        fin = fields["fin"] if is_valid_fin(fields["fin"] or "") else None
+        serial = (
+            fields["serial"]
+            if is_valid_old_card_serial(fields["serial"] or "")
+            else None
         )
         return MRZResult(
             fin=fin,
@@ -360,10 +577,10 @@ class MRZExtractor:
             line1=line1,
             line2=line2,
             line3="",
-            checksum_valid=checksum_valid,
+            checksum_valid=bool(fields["checksum_valid"]),
             method=f"td2_{attempt}" if fin else "not_found",
             card_type="older_card",
-            card_serial_number=None,
+            card_serial_number=serial,
         )
 
     def _parse_td1(
@@ -385,48 +602,20 @@ class MRZExtractor:
         raw_line1, line1_confidence = selected_lines[0]
         raw_line2, line2_confidence = selected_lines[1]
         raw_line3, line3_confidence = selected_lines[2]
-        line1 = self._normalize_length(raw_line1, 30)
-        line2 = self._normalize_length(raw_line2, 30)
-        line3 = self._normalize_length(raw_line3, 30)
+        line1 = self._normalize_length(raw_line1, TD1_LINE_LENGTH)
+        line2 = self._normalize_length(raw_line2, TD1_LINE_LENGTH)
+        line3 = self._normalize_length(raw_line3, TD1_LINE_LENGTH)
 
-        issuing_state = line1[2:5]
+        issuing_state = TD1_ISSUING_STATE.read(line1)
         if not issuing_state.isalnum():
             issuing_state = "AZE"
 
-        candidates: list[tuple[str, int, int]] = []
-        for offset in [15, 14, 13, 16]:
-            optional_data = line1[offset:29].rstrip("<")
-            if not optional_data:
-                continue
-            if (
-                optional_data.startswith(issuing_state)
-                and len(optional_data) >= len(issuing_state) + 7
-            ):
-                value = optional_data[
-                    len(issuing_state) : len(issuing_state) + 7
-                ]
-                if is_valid_fin(value):
-                    candidates.append(
-                        (value, 10 + (2 if offset == 15 else 0), offset)
-                    )
-            if is_valid_fin(optional_data):
-                candidates.append(
-                    (optional_data, 8 + (2 if offset == 15 else 0), offset)
-                )
-            for value in re.findall(r"[A-Z0-9]{7}", optional_data):
-                if value != issuing_state:
-                    candidates.append((value, 5, offset))
-            for value in re.findall(r"[A-Z0-9]{5,8}", optional_data):
-                if value != issuing_state:
-                    candidates.append((value, 3, offset))
-
-        candidates.sort(key=lambda item: item[0])
-        candidates.sort(key=lambda item: item[1], reverse=True)
-        fin_candidate = candidates[0][0] if candidates else None
+        fin_candidate = self._extract_td1_fin(line1, issuing_state)
+        serial_check = TD1_SERIAL_CHECK.read(line1)
         checksum_valid = (
-            len(line1) >= 15
-            and line1[14].isdigit()
-            and compute_mrz_check_digit(line1[5:14]) == int(line1[14])
+            serial_check.isdigit()
+            and compute_mrz_check_digit(TD1_SERIAL.read(line1))
+            == int(serial_check)
         )
         confidence = (
             (line1_confidence + line2_confidence + line3_confidence) / 3.0
@@ -461,11 +650,6 @@ class MRZExtractor:
                 else None
             ),
         )
-
-    @staticmethod
-    def _extract_new_card_serial_number(line1: str) -> str | None:
-        match = re.search(r"A[AB]\d{7}", line1[:16])
-        return match.group(0) if match is not None else None
 
     @classmethod
     def is_structurally_valid(cls, result: MRZResult) -> bool:
