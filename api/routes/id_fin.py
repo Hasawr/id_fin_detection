@@ -5,13 +5,22 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from api.auth import require_api_key
-from api.schemas import IdFinBatchResponse, IdFinResponse
+from api.schemas import (
+    IdFinBatchData,
+    IdFinBatchItem,
+    IdFinBatchResponse,
+    IdFinResponse,
+)
 from services.id_fin.service import IDFinService, get_id_fin_service
 from shared.config import Settings, get_settings
 from shared.image_io import save_upload
 
 
-router = APIRouter(prefix="/v1", tags=["id-fin"])
+router = APIRouter(
+    prefix="/v1",
+    tags=["id-fin"],
+    dependencies=[Depends(require_api_key)],
+)
 
 
 @router.post(
@@ -35,15 +44,18 @@ router = APIRouter(prefix="/v1", tags=["id-fin"])
     },
 )
 async def detect_id_fin(
-    api_key: Annotated[str, Depends(require_api_key)],
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
+    settings: Annotated[Settings, Depends(get_settings)],
     mrz: Annotated[UploadFile, File(description="ID card MRZ-side image")],
 ) -> IdFinResponse:
-    del api_key
-
     with TemporaryDirectory(prefix="ocr-id-fin-") as directory:
         temporary_directory = Path(directory)
-        image_path = await save_upload(mrz, temporary_directory, "mrz")
+        image_path = await save_upload(
+            mrz,
+            temporary_directory,
+            "mrz",
+            settings,
+        )
         data = await service.process(image_path=image_path)
 
     return IdFinResponse(service="id-fin", data=data)
@@ -58,8 +70,7 @@ async def detect_id_fin(
         "Each result includes `fin`, `confidence`, and `mrz_details` "
         "(with `card_serial_number` for validated new-card and older-card "
         "serials). "
-        "Images in a batch are processed in parallel up to "
-        "`OCR_MAX_CONCURRENCY` GPU workers."
+        "Images in a batch are processed sequentially by one OCR engine."
     ),
     responses={
         400: {"description": "An uploaded image is empty"},
@@ -71,7 +82,6 @@ async def detect_id_fin(
     },
 )
 async def detect_id_fin_batch(
-    api_key: Annotated[str, Depends(require_api_key)],
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
     settings: Annotated[Settings, Depends(get_settings)],
     mrz: Annotated[
@@ -79,7 +89,6 @@ async def detect_id_fin_batch(
         File(description="One or more ID card MRZ-side images"),
     ],
 ) -> IdFinBatchResponse:
-    del api_key
     if len(mrz) > settings.max_batch_files:
         for upload in mrz:
             await upload.close()
@@ -90,23 +99,37 @@ async def detect_id_fin_batch(
 
     with TemporaryDirectory(prefix="ocr-id-fin-batch-") as directory:
         temporary_directory = Path(directory)
-        image_paths = [
-            await save_upload(upload, temporary_directory, f"mrz_{index}")
-            for index, upload in enumerate(mrz)
-        ]
+        image_paths: list[Path] = []
+        batch_bytes = 0
+        for index, upload in enumerate(mrz):
+            image_path = await save_upload(
+                upload,
+                temporary_directory,
+                f"mrz_{index}",
+                settings,
+            )
+            batch_bytes += image_path.stat().st_size
+            if batch_bytes > settings.max_batch_bytes:
+                for remaining_upload in mrz[index + 1 :]:
+                    await remaining_upload.close()
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail="Batch exceeds the configured total size limit.",
+                )
+            image_paths.append(image_path)
         detected_results = await service.process_many(image_paths=image_paths)
 
     results = [
-        {
-            "index": index,
-            "file_name": Path(upload.filename or f"mrz_{index}").name,
+        IdFinBatchItem(
+            index=index,
+            file_name=Path(upload.filename or f"mrz_{index}").name,
             **detected_result,
-        }
+        )
         for index, (upload, detected_result) in enumerate(
             zip(mrz, detected_results, strict=True)
         )
     ]
     return IdFinBatchResponse(
         service="id-fin",
-        data={"count": len(results), "results": results},
+        data=IdFinBatchData(count=len(results), results=results),
     )

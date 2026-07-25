@@ -3,7 +3,9 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -16,7 +18,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from services.id_fin.detector import FINDetector
+from services.id_fin.detector import FINDetector, PRODUCTION_OCR_VERSION
+
+
+ATTEMPT_TIMING_PATTERN = re.compile(
+    r"^OCR attempt ([a-z0-9_]+): ([0-9.]+)s\.$"
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -31,6 +38,11 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--ocr-max-side", type=int, default=1600)
     parser.add_argument("--det-limit-side-len", type=int, default=960)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument(
+        "--stress",
+        action="store_true",
+        help="Add deterministic rotation, blur, scale, and contrast variants.",
+    )
     return parser.parse_args()
 
 
@@ -47,6 +59,53 @@ def warm_latency_improvement(
     if baseline_median <= 0:
         raise ValueError("Baseline warm median must be positive.")
     return (baseline_median - current_median) / baseline_median
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        raise ValueError("Cannot calculate a percentile without values.")
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, int(len(ordered) * fraction))
+    return ordered[index]
+
+
+def gpu_memory_used_mib() -> int | None:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return max(
+            int(line.strip())
+            for line in completed.stdout.splitlines()
+            if line.strip()
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def edit_distance(expected: str, actual: str) -> int:
+    previous = list(range(len(actual) + 1))
+    for expected_index, expected_character in enumerate(expected, start=1):
+        current = [expected_index]
+        for actual_index, actual_character in enumerate(actual, start=1):
+            current.append(
+                min(
+                    current[-1] + 1,
+                    previous[actual_index] + 1,
+                    previous[actual_index - 1]
+                    + (expected_character != actual_character),
+                )
+            )
+        previous = current
+    return previous[-1]
 
 
 def materialize_case(
@@ -77,6 +136,78 @@ def materialize_case(
     return output_path
 
 
+def materialize_stress_variants(
+    case: dict[str, Any],
+    source_path: Path,
+    temporary_directory: Path,
+) -> list[tuple[dict[str, Any], Path]]:
+    image = cv2.imread(str(source_path))
+    if image is None:
+        raise ValueError(f"Fixture is not readable: {case['id']}")
+    height, width = image.shape[:2]
+    rotation = cv2.getRotationMatrix2D(
+        (width / 2.0, height / 2.0),
+        3.0,
+        1.0,
+    )
+    transformed = {
+        "rotation_3deg": cv2.warpAffine(
+            image,
+            rotation,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        ),
+        "downscale_50pct": cv2.resize(
+            cv2.resize(
+                image,
+                (max(1, width // 2), max(1, height // 2)),
+                interpolation=cv2.INTER_AREA,
+            ),
+            (width, height),
+            interpolation=cv2.INTER_CUBIC,
+        ),
+        "gaussian_blur": cv2.GaussianBlur(image, (5, 5), 1.2),
+        "low_contrast": cv2.convertScaleAbs(image, alpha=0.65, beta=45),
+    }
+    variants: list[tuple[dict[str, Any], Path]] = []
+    for variant_name, variant_image in transformed.items():
+        variant_case = {
+            **case,
+            "id": f"{case['id']}::{variant_name}",
+            "stress_variant": variant_name,
+        }
+        safe_name = hashlib.sha256(
+            str(variant_case["id"]).encode("utf-8")
+        ).hexdigest()[:12]
+        output_path = temporary_directory / f"{safe_name}.png"
+        if not cv2.imwrite(str(output_path), variant_image):
+            raise OSError(f"Could not write stress variant: {variant_name}")
+        variants.append((variant_case, output_path))
+    return variants
+
+
+def materialize_benchmark_cases(
+    cases: list[dict[str, Any]],
+    temporary_directory: Path,
+    *,
+    include_stress: bool,
+) -> list[tuple[dict[str, Any], Path]]:
+    materialized: list[tuple[dict[str, Any], Path]] = []
+    for case in cases:
+        fixture_path = materialize_case(case, temporary_directory)
+        materialized.append((case, fixture_path))
+        if include_stress:
+            materialized.extend(
+                materialize_stress_variants(
+                    case,
+                    fixture_path,
+                    temporary_directory,
+                )
+            )
+    return materialized
+
+
 def benchmark() -> tuple[dict[str, Any], int]:
     arguments = parse_arguments()
     if arguments.runs < 2:
@@ -89,9 +220,13 @@ def benchmark() -> tuple[dict[str, Any], int]:
 
     with tempfile.TemporaryDirectory(prefix="ocr-benchmark-") as directory:
         temporary_directory = Path(directory)
-        fixture_paths = [
-            materialize_case(case, temporary_directory) for case in cases
-        ]
+        materialized_cases = materialize_benchmark_cases(
+            cases,
+            temporary_directory,
+            include_stress=arguments.stress,
+        )
+        benchmark_cases = [case for case, _ in materialized_cases]
+        fixture_paths = [path for _, path in materialized_cases]
 
         initialization_started = time.perf_counter()
         detector = FINDetector(
@@ -103,9 +238,27 @@ def benchmark() -> tuple[dict[str, Any], int]:
 
         timings: list[float] = []
         warm_timings: list[float] = []
+        timings_by_case: dict[str, list[float]] = {
+            case["id"]: [] for case in benchmark_cases
+        }
+        attempt_timings: dict[str, list[float]] = {}
+        gpu_memory_samples: list[int] = []
+        initial_gpu_memory = (
+            None if arguments.cpu else gpu_memory_used_mib()
+        )
+        if initial_gpu_memory is not None:
+            gpu_memory_samples.append(initial_gpu_memory)
+        mrz_character_edits = 0
+        mrz_expected_characters = 0
+        filler_expected = 0
+        filler_preserved = 0
         case_results: list[dict[str, Any]] = []
         fallback_count = 0
         method_counts: Counter[str] = Counter()
+        miss_categories: Counter[str] = Counter()
+        attempts_to_result: list[int] = []
+        checksum_valid_count = 0
+        secondary_checksum_valid_count = 0
         case_accuracy = {
             case["id"]: {
                 "fin_matches": True,
@@ -116,19 +269,40 @@ def benchmark() -> tuple[dict[str, Any], int]:
                     else {}
                 ),
             }
-            for case in cases
+            for case in benchmark_cases
         }
         total_inferences = 0
 
         for run_index in range(arguments.runs):
-            for case, fixture_path in zip(cases, fixture_paths, strict=True):
+            for case, fixture_path in zip(
+                benchmark_cases,
+                fixture_paths,
+                strict=True,
+            ):
                 started = time.perf_counter()
                 result = detector.detect_from_mrz(fixture_path)
                 elapsed = time.perf_counter() - started
                 timings.append(elapsed)
+                timings_by_case[case["id"]].append(elapsed)
                 if run_index > 0:
                     warm_timings.append(elapsed)
                 total_inferences += 1
+                if not arguments.cpu:
+                    memory_used = gpu_memory_used_mib()
+                    if memory_used is not None:
+                        gpu_memory_samples.append(memory_used)
+                inference_attempts = 0
+                attempted_method_names: set[str] = set()
+                for note in result.notes:
+                    timing_match = ATTEMPT_TIMING_PATTERN.match(note)
+                    if timing_match:
+                        inference_attempts += 1
+                        attempted_method_names.add(timing_match.group(1))
+                        attempt_timings.setdefault(
+                            timing_match.group(1),
+                            [],
+                        ).append(float(timing_match.group(2)))
+                attempts_to_result.append(inference_attempts)
 
                 method = (
                     result.mrz_result.method
@@ -136,8 +310,8 @@ def benchmark() -> tuple[dict[str, Any], int]:
                     else "not_found"
                 )
                 method_counts[method] += 1
-                did_fallback = not method.endswith(
-                    ("mrz_strip", "mrz_roi")
+                did_fallback = bool(
+                    attempted_method_names & FINDetector.RECOVERY_ATTEMPTS
                 )
                 if did_fallback:
                     fallback_count += 1
@@ -146,6 +320,13 @@ def benchmark() -> tuple[dict[str, Any], int]:
                     if result.mrz_result is not None
                     else "unknown"
                 )
+                if result.mrz_result is not None:
+                    checksum_valid_count += int(
+                        result.mrz_result.checksum_valid
+                    )
+                    secondary_checksum_valid_count += int(
+                        result.mrz_result.secondary_checksum_valid
+                    )
                 fin_matches = (
                     hash_fin(result.fin) == case["expected_fin_sha256"]
                 )
@@ -166,14 +347,61 @@ def benchmark() -> tuple[dict[str, Any], int]:
                         hash_fin(serial_number)
                         == case["expected_serial_sha256"]
                     )
+                expected_mrz_lines = case.get("expected_mrz_lines")
+                if (
+                    isinstance(expected_mrz_lines, list)
+                    and result.mrz_result is not None
+                ):
+                    actual_lines = [
+                        result.mrz_result.line1,
+                        result.mrz_result.line2,
+                        result.mrz_result.line3,
+                    ][: len(expected_mrz_lines)]
+                    for expected_line, actual_line in zip(
+                        expected_mrz_lines,
+                        actual_lines,
+                        strict=True,
+                    ):
+                        expected_text = str(expected_line)
+                        mrz_character_edits += edit_distance(
+                            expected_text,
+                            actual_line,
+                        )
+                        mrz_expected_characters += len(expected_text)
+                        for index, character in enumerate(expected_text):
+                            if character != "<":
+                                continue
+                            filler_expected += 1
+                            if (
+                                index < len(actual_line)
+                                and actual_line[index] == "<"
+                            ):
+                                filler_preserved += 1
 
                 if run_index == arguments.runs - 1:
+                    if result.fin is None:
+                        miss_categories["null_fin"] += 1
+                    elif not fin_matches:
+                        miss_categories["wrong_fin"] += 1
+                    if not card_type_matches:
+                        miss_categories["wrong_card_type"] += 1
+                    serial_matches = case_accuracy[case["id"]].get(
+                        "serial_matches"
+                    )
+                    if serial_matches is False:
+                        miss_categories["wrong_serial"] += 1
                     case_results.append(
                         {
                             "id": case["id"],
                             **case_accuracy[case["id"]],
                             "detected_card_type": card_type,
                             "method": method,
+                            "attempts_run": inference_attempts,
+                            "stress_variant": case.get("stress_variant"),
+                            "checksum_valid": bool(
+                                result.mrz_result
+                                and result.mrz_result.checksum_valid
+                            ),
                         }
                     )
 
@@ -190,17 +418,15 @@ def benchmark() -> tuple[dict[str, Any], int]:
         "engine": "paddleocr-gpu" if not arguments.cpu else "paddleocr-cpu",
         "ocr_max_side": arguments.ocr_max_side,
         "det_limit_side_len": arguments.det_limit_side_len,
-        "case_count": len(cases),
+        "ocr_model_version": PRODUCTION_OCR_VERSION,
+        "source_case_count": len(cases),
+        "case_count": len(benchmark_cases),
+        "stress_enabled": arguments.stress,
         "runs": arguments.runs,
         "initialization_seconds": round(initialization_seconds, 4),
         "cold_first_inference_seconds": round(timings[0], 4),
         "warm_median_seconds": round(statistics.median(warm_timings), 4),
-        "warm_p95_seconds": round(
-            sorted(warm_timings)[
-                min(len(warm_timings) - 1, int(len(warm_timings) * 0.95))
-            ],
-            4,
-        ),
+        "warm_p95_seconds": round(percentile(warm_timings, 0.95), 4),
         "warm_images_per_second": round(len(warm_timings) / warm_total, 4),
         "cropped_pass_count": total_inferences - fallback_count,
         "full_image_fallback_count": fallback_count,
@@ -208,9 +434,68 @@ def benchmark() -> tuple[dict[str, Any], int]:
             fallback_count / total_inferences, 4
         ),
         "method_counts": dict(sorted(method_counts.items())),
+        "miss_categories": dict(sorted(miss_categories.items())),
+        "attempts_to_result": {
+            "median": round(statistics.median(attempts_to_result), 2),
+            "p95": percentile(
+                [float(value) for value in attempts_to_result],
+                0.95,
+            ),
+            "maximum": max(attempts_to_result),
+        },
+        "checksum_valid_rate": round(
+            checksum_valid_count / total_inferences,
+            4,
+        ),
+        "secondary_checksum_valid_rate": round(
+            secondary_checksum_valid_count / total_inferences,
+            4,
+        ),
+        "attempt_timings": {
+            attempt_name: {
+                "count": len(values),
+                "median_seconds": round(statistics.median(values), 4),
+                "p95_seconds": round(percentile(values, 0.95), 4),
+                "total_seconds": round(sum(values), 4),
+            }
+            for attempt_name, values in sorted(attempt_timings.items())
+        },
+        "per_image_latency": {
+            case_id: {
+                "median_seconds": round(statistics.median(values), 4),
+                "p95_seconds": round(percentile(values, 0.95), 4),
+            }
+            for case_id, values in timings_by_case.items()
+        },
+        "exact_match_rates": {
+            key.removesuffix("_matches"): round(
+                sum(bool(case.get(key)) for case in case_results)
+                / len(case_results),
+                4,
+            )
+            for key in (
+                "fin_matches",
+                "card_type_matches",
+                "serial_matches",
+            )
+            if any(key in case for case in case_results)
+        },
+        "peak_gpu_memory_mib": (
+            max(gpu_memory_samples) if gpu_memory_samples else None
+        ),
         "all_expected_results_match": all_accurate,
         "cases": case_results,
     }
+    if mrz_expected_characters:
+        metrics["mrz_character_error_rate"] = round(
+            mrz_character_edits / mrz_expected_characters,
+            6,
+        )
+    if filler_expected:
+        metrics["mrz_filler_preservation_rate"] = round(
+            filler_preserved / filler_expected,
+            6,
+        )
 
     exit_code = 0 if all_accurate else 2
     if arguments.baseline is not None:

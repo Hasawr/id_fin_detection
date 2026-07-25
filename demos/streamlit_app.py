@@ -3,6 +3,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Callable
 
 import streamlit as st
 
@@ -32,15 +33,12 @@ st.markdown(
 )
 
 # Increment when cached detector/result objects become incompatible.
-RESULT_SCHEMA_VERSION = 9
+RESULT_SCHEMA_VERSION = 10
 
 
 @st.cache_resource
-def get_ocr_service(use_gpu: bool, workers: int) -> IDFinService:
-    return IDFinService(
-        use_gpu=use_gpu,
-        max_concurrency=workers,
-    )
+def get_ocr_service(use_gpu: bool) -> IDFinService:
+    return IDFinService(use_gpu=use_gpu)
 
 
 def clear_detection_results() -> None:
@@ -50,6 +48,9 @@ def clear_detection_results() -> None:
 
 def clear_ocr_runtime() -> None:
     clear_detection_results()
+    service = st.session_state.pop("ocr_service", None)
+    if service is not None:
+        service.close()
     get_ocr_service.clear()
 
 
@@ -61,7 +62,7 @@ async def process_jobs(
     service: IDFinService,
     jobs: list[tuple[str, bytes, Path]],
     *,
-    parallel: bool,
+    handle_progress: Callable[[int, int], None] | None = None,
 ) -> list[tuple[str, bytes, FINDetectionOutput, float]]:
     async def run_job(
         file_name: str,
@@ -80,19 +81,11 @@ async def process_jobs(
         elapsed = time.perf_counter() - started
         return file_name, image_bytes, detection, elapsed
 
-    if parallel:
-        return list(
-            await asyncio.gather(
-                *(
-                    run_job(file_name, image_bytes, image_path)
-                    for file_name, image_bytes, image_path in jobs
-                )
-            )
-        )
-
     results: list[tuple[str, bytes, FINDetectionOutput, float]] = []
     for file_name, image_bytes, image_path in jobs:
         results.append(await run_job(file_name, image_bytes, image_path))
+        if handle_progress is not None:
+            handle_progress(len(results), len(jobs))
     return results
 
 
@@ -100,10 +93,8 @@ def build_batch_stats(
     timed_results: list[tuple[str, bytes, FINDetectionOutput, float]],
     *,
     total_seconds: float,
-    parallel: bool,
-    workers: int,
+    initialization_seconds: float = 0.0,
 ) -> dict[str, object]:
-    per_image = [elapsed for *_, elapsed in timed_results]
     detected = sum(1 for _, _, result, _ in timed_results if result.fin)
     errors = sum(
         1
@@ -111,21 +102,17 @@ def build_batch_stats(
         if has_processing_error(result)
     )
     not_found = len(timed_results) - detected - errors
-    sum_serial = sum(per_image)
     throughput = (
         len(timed_results) / total_seconds if total_seconds > 0 else 0.0
     )
-    speedup = sum_serial / total_seconds if total_seconds > 0 else 1.0
     return {
-        "parallel": parallel,
-        "workers": workers,
         "total_images": len(timed_results),
         "detected": detected,
         "not_found": not_found,
         "errors": errors,
         "total_seconds": total_seconds,
+        "initialization_seconds": initialization_seconds,
         "throughput": throughput,
-        "speedup_vs_serial_sum": speedup,
     }
 
 
@@ -136,52 +123,25 @@ def render_id_fin_demo() -> None:
     )
 
     if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
-        clear_detection_results()
-        get_ocr_service.clear()
+        clear_ocr_runtime()
         st.session_state["result_schema_version"] = RESULT_SCHEMA_VERSION
 
     settings = get_settings()
-    default_workers = settings.ocr_max_concurrency
 
     st.subheader("Runtime")
-    runtime_cols = st.columns([1, 1.2, 1])
-    with runtime_cols[0]:
-        use_gpu = st.checkbox(
-            "Use GPU",
-            value=settings.use_gpu,
-            on_change=clear_ocr_runtime,
-        )
-    with runtime_cols[1]:
-        parallel_batch = st.checkbox(
-            "Parallel batch processing",
-            value=True,
-            help=(
-                "Process uploaded images together on a GPU worker pool "
-                "(same model as the FastAPI service). Turn off to run one-by-one."
-            ),
-            on_change=clear_detection_results,
-        )
-    with runtime_cols[2]:
-        workers = st.number_input(
-            "GPU workers",
-            min_value=1,
-            max_value=16,
-            value=min(max(default_workers, 1), 16),
-            step=1,
-            disabled=not parallel_batch,
-            help=(
-                f"From .env OCR_MAX_CONCURRENCY={default_workers} on this machine."
-            ),
-            on_change=clear_ocr_runtime,
-        )
+    use_gpu = st.checkbox(
+        "Use GPU",
+        value=settings.use_gpu,
+        on_change=clear_ocr_runtime,
+    )
     st.caption(
-        f"Service defaults: concurrency={settings.ocr_max_concurrency}, "
+        f"One OCR engine processes images sequentially · "
         f"max batch={settings.max_batch_files}"
     )
 
     mrz_files = st.file_uploader(
         "MRZ-side images (front on older cards, back on new cards)",
-        type=["png", "jpg", "jpeg", "webp", "bmp"],
+        type=["png", "jpg", "jpeg", "bmp"],
         accept_multiple_files=True,
         on_change=clear_detection_results,
     )
@@ -192,11 +152,7 @@ def render_id_fin_demo() -> None:
     if mrz_files:
         st.caption(
             f"{len(mrz_files)} file(s) selected"
-            + (
-                f" · parallel with {int(workers)} worker(s)"
-                if parallel_batch
-                else " · sequential"
-            )
+            + " · sequential"
         )
         if has_too_many_files:
             st.error(
@@ -205,8 +161,8 @@ def render_id_fin_demo() -> None:
             )
 
     process_label = (
-        f"Process {len(mrz_files)} images in parallel"
-        if parallel_batch and mrz_files
+        f"Process {len(mrz_files)} ID cards"
+        if mrz_files
         else "Process ID card"
     )
     if st.button(
@@ -226,20 +182,41 @@ def render_id_fin_demo() -> None:
                 mrz_path.write_bytes(image_bytes)
                 jobs.append((mrz_file.name, image_bytes, mrz_path))
 
+            initialization_started_at = time.perf_counter()
+            service = get_ocr_service(use_gpu)
+            st.session_state["ocr_service"] = service
+            initialization_seconds = (
+                time.perf_counter() - initialization_started_at
+            )
             started_at = time.perf_counter()
-            service = get_ocr_service(use_gpu, int(workers))
-            if parallel_batch:
-                with st.spinner(
-                    f"Running {len(jobs)} images on {int(workers)} GPU workers…"
-                ):
-                    timed_results = asyncio.run(
-                        process_jobs(service, jobs, parallel=True)
+            timed_results: list[
+                tuple[str, bytes, FINDetectionOutput, float]
+            ] = []
+            progress = st.progress(0.0, text="Preparing OCR batch…")
+
+            def handle_progress(completed: int, total: int) -> None:
+                elapsed_so_far = time.perf_counter() - started_at
+                throughput = (
+                    completed / elapsed_so_far
+                    if elapsed_so_far > 0
+                    else 0.0
+                )
+                progress.progress(
+                    completed / total,
+                    text=(
+                        f"Completed {completed}/{total} "
+                        f"· {throughput:.2f} images/s"
+                    ),
+                )
+
+            with st.spinner(f"Processing {len(jobs)} image(s)…"):
+                timed_results = asyncio.run(
+                    process_jobs(
+                        service,
+                        jobs,
+                        handle_progress=handle_progress,
                     )
-            else:
-                with st.spinner(f"Running {len(jobs)} images sequentially…"):
-                    timed_results = asyncio.run(
-                        process_jobs(service, jobs, parallel=False)
-                    )
+                )
             total_seconds = time.perf_counter() - started_at
 
         st.session_state["detected_results"] = [
@@ -249,8 +226,7 @@ def render_id_fin_demo() -> None:
         st.session_state["batch_stats"] = build_batch_stats(
             timed_results,
             total_seconds=total_seconds,
-            parallel=parallel_batch,
-            workers=int(workers) if parallel_batch else 1,
+            initialization_seconds=initialization_seconds,
         )
 
     detected_results = st.session_state.get("detected_results", [])
@@ -261,11 +237,11 @@ def render_id_fin_demo() -> None:
     st.success(
         f"Completed {batch_stats['total_images']} image(s) in "
         f"{batch_stats['total_seconds']:.2f}s"
-        + (
-            f" · {batch_stats['workers']} GPU workers"
-            if batch_stats["parallel"]
-            else " · sequential"
-        )
+        + " · sequential"
+    )
+    st.caption(
+        "OCR processing time excludes model initialization/runtime lookup "
+        f"({float(batch_stats['initialization_seconds']):.2f}s)."
     )
 
     st.subheader("Batch summary")
@@ -283,21 +259,7 @@ def render_id_fin_demo() -> None:
         f"{float(batch_stats['total_seconds']):.2f}s",
     )
 
-    mode_cols = st.columns(3)
-    mode_cols[0].write(
-        f"**Mode:** "
-        f"{'Parallel GPU pool' if batch_stats['parallel'] else 'Sequential'}"
-    )
-    mode_cols[1].write(f"**Workers:** `{batch_stats['workers']}`")
-    mode_cols[2].write(
-        f"**Relative speedup:** "
-        f"`{float(batch_stats['speedup_vs_serial_sum']):.2f}x` "
-        f"(sum of per-image times ÷ wall time)"
-    )
-    st.caption(
-        "Speedup compares parallel wall time to the sum of each image's own "
-        "OCR duration. Values near the worker count mean good multi-worker use."
-    )
+    st.write("**Mode:** Sequential single-engine OCR")
 
     summary_rows = []
     for index, (file_name, _, result, elapsed) in enumerate(detected_results):

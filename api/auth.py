@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 from typing import Annotated
 
@@ -11,11 +12,15 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def _keys_match(supplied_key: str, expected_key: str) -> bool:
-    supplied_bytes = supplied_key.encode("utf-8")
-    expected_bytes = expected_key.encode("utf-8")
-    return (
-        len(supplied_bytes) == len(expected_bytes)
-        and hmac.compare_digest(supplied_bytes, expected_bytes)
+    supplied_digest = hashlib.sha256(
+        supplied_key.encode("utf-8")
+    ).digest()
+    expected_digest = hashlib.sha256(
+        expected_key.encode("utf-8")
+    ).digest()
+    return hmac.compare_digest(
+        supplied_digest,
+        expected_digest,
     )
 
 

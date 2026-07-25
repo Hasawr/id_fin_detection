@@ -10,6 +10,7 @@ from api.schemas import ErrorDetail, IdFinResponse
 from services.id_fin.detector import OCRProcessingError
 from services.id_fin.service import get_id_fin_service
 from shared.audit import get_audit_store
+from shared.config import get_settings, validate_security_settings
 
 
 logging.basicConfig(
@@ -20,7 +21,21 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.audit_store = get_audit_store()
+    settings_provider = app.dependency_overrides.get(
+        get_settings,
+        get_settings,
+    )
+    settings = settings_provider()
+    validate_security_settings(settings)
+    app.state.settings = settings
+    app.state.audit_store = get_audit_store(
+        settings.audit_db_path,
+        payload_dir=settings.audit_payload_dir,
+    )
+    app.state.audit_store.prune(
+        retention_days=settings.audit_retention_days,
+        max_payload_bytes=settings.audit_max_payload_bytes,
+    )
     try:
         yield
     finally:

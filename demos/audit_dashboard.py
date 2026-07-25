@@ -57,9 +57,16 @@ def format_when_short(value: str) -> str:
 
 def resolve_saved_path(saved_path: str, store: AuditStore) -> Path:
     path = Path(saved_path)
-    if path.is_absolute():
-        return path
-    return store.payload_dir.parent / path
+    data_root = store.payload_dir.parent.resolve()
+    payload_root = store.payload_dir.resolve()
+    resolved = (
+        path.resolve()
+        if path.is_absolute()
+        else (data_root / path).resolve()
+    )
+    if resolved != payload_root and payload_root not in resolved.parents:
+        raise ValueError("Saved payload path is outside the audit payload root.")
+    return resolved
 
 
 def result_badge(event: AuditEvent) -> str:
@@ -567,7 +574,11 @@ def render_integration_audit() -> None:
                         st.caption(f"No saved path for {label}")
                         continue
 
-                    file_path = resolve_saved_path(str(saved), store)
+                    try:
+                        file_path = resolve_saved_path(str(saved), store)
+                    except ValueError:
+                        st.error(f"Unsafe saved path blocked: {label}")
+                        continue
                     if not file_path.exists():
                         st.warning(f"Missing file: {label}")
                         continue
@@ -579,7 +590,6 @@ def render_integration_audit() -> None:
                             ".png",
                             ".jpg",
                             ".jpeg",
-                            ".webp",
                             ".bmp",
                         }
                         if is_image:

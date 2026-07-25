@@ -13,9 +13,10 @@ from typing import Any, Callable
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from starlette.types import ASGIApp, Message
+from starlette.types import Message
 
 from shared.audit import AuditStore, get_audit_store, sanitize_filename, service_from_path
+from shared.config import get_settings
 
 
 logger = logging.getLogger(__name__)
@@ -30,9 +31,6 @@ SKIP_PREFIXES = (
 
 
 class AuditMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
-
     async def dispatch(
         self,
         request: Request,
@@ -42,8 +40,16 @@ class AuditMiddleware(BaseHTTPMiddleware):
         if any(path == prefix or path.startswith(f"{prefix}/") for prefix in SKIP_PREFIXES):
             return await call_next(request)
 
-        request_body = await request.body()
-        request = Request(request.scope, self._replay_receive(request_body))
+        settings = getattr(request.app.state, "settings", None)
+        if settings is None:
+            settings = get_settings()
+        request_body = b""
+        if settings.audit_store_payloads:
+            request_body = await request.body()
+            request = Request(
+                request.scope,
+                self._replay_receive(request_body),
+            )
 
         started_at = time.perf_counter()
         response = await call_next(request)
@@ -55,16 +61,31 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
         content_type = response.headers.get("content-type", "")
         parsed_response = self._parse_json(response_body, content_type)
-        error_code = self._extract_error_code(parsed_response, response_body, content_type)
+        error_code = self._extract_error_code(parsed_response)
+        sanitized_response = self._sanitize_response(
+            parsed_response,
+            response.status_code,
+        )
 
         store = getattr(request.app.state, "audit_store", None) or get_audit_store()
 
         try:
-            request_files, payload_dir = self._persist_request_payload(
-                store=store,
-                content_type=request.headers.get("content-type"),
-                body=request_body,
-            )
+            request_files: list[dict[str, Any]] = []
+            payload_dir = None
+            if (
+                settings.audit_store_payloads
+                and response.status_code < 400
+                and request_body
+                and store.can_store_payload(
+                    len(request_body),
+                    settings.audit_max_payload_bytes,
+                )
+            ):
+                request_files, payload_dir = self._persist_request_payload(
+                    store=store,
+                    content_type=request.headers.get("content-type"),
+                    body=request_body,
+                )
             store.record(
                 method=request.method,
                 path=path,
@@ -78,10 +99,12 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 request_content_type=request.headers.get("content-type"),
                 request_query=request.url.query or None,
                 request_files=request_files,
-                response_body=parsed_response if parsed_response is not None else (
-                    response_body.decode("utf-8", errors="replace") if response_body else None
-                ),
+                response_body=sanitized_response,
                 payload_dir=payload_dir,
+            )
+            store.maybe_prune(
+                retention_days=settings.audit_retention_days,
+                max_payload_bytes=settings.audit_max_payload_bytes,
             )
         except Exception:
             logger.exception("Failed to write API audit event for %s %s", request.method, path)
@@ -216,18 +239,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             return None
 
     @staticmethod
-    def _extract_error_code(
-        parsed: Any,
-        body: bytes,
-        content_type: str,
-    ) -> str | None:
-        payload = parsed
-        if payload is None and body and "application/json" in content_type:
-            try:
-                payload = json.loads(body)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return None
-
+    def _extract_error_code(payload: Any) -> str | None:
         if not isinstance(payload, dict):
             return None
 
@@ -240,3 +252,68 @@ class AuditMiddleware(BaseHTTPMiddleware):
         if isinstance(detail, str):
             return detail[:120]
         return None
+
+    @classmethod
+    def _sanitize_response(
+        cls,
+        payload: Any,
+        status_code: int,
+    ) -> Any:
+        if not isinstance(payload, dict):
+            return {"status_code": status_code}
+
+        sanitized: dict[str, Any] = {
+            "service": payload.get("service"),
+            "version": payload.get("version"),
+        }
+        error = payload.get("error")
+        if isinstance(error, dict):
+            sanitized["error"] = {"code": error.get("code")}
+            return sanitized
+        if status_code >= 400:
+            sanitized["detail"] = "Request rejected."
+            return sanitized
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            return sanitized
+        if "fin" in data:
+            sanitized["data"] = cls._sanitize_detection(data)
+            return sanitized
+
+        results = data.get("results")
+        if isinstance(results, list):
+            sanitized_results = [
+                {
+                    "index": item.get("index"),
+                    **cls._sanitize_detection(item),
+                }
+                for item in results
+                if isinstance(item, dict)
+            ]
+            sanitized["data"] = {
+                "count": len(sanitized_results),
+                "results": sanitized_results,
+            }
+        return sanitized
+
+    @staticmethod
+    def _sanitize_detection(item: dict[str, Any]) -> dict[str, Any]:
+        details = item.get("mrz_details")
+        safe_details = None
+        if isinstance(details, dict):
+            safe_details = {
+                "card_type": details.get("card_type"),
+                "method": details.get("method"),
+                "checksum_valid": details.get("checksum_valid"),
+                "card_serial_number": (
+                    "[REDACTED]"
+                    if details.get("card_serial_number")
+                    else None
+                ),
+            }
+        return {
+            "fin": "[REDACTED]" if item.get("fin") else None,
+            "confidence": item.get("confidence"),
+            "mrz_details": safe_details,
+        }

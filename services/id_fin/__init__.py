@@ -12,6 +12,10 @@ class MRZResult:
     method: str
     card_type: str
     card_serial_number: str | None
+    line_confidences: tuple[float, ...] = ()
+    quality_score: float = 0.0
+    fin_is_canonical: bool = False
+    secondary_checksum_valid: bool = False
 
 
 @dataclass

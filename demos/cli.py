@@ -31,7 +31,10 @@ def parse_arguments() -> argparse.Namespace:
 
 def main() -> None:
     arguments = parse_arguments()
-    detector = FINDetector(use_gpu=not arguments.cpu, debug=arguments.debug)
+    detector = FINDetector(
+        use_gpu=not arguments.cpu,
+        save_debug_images=arguments.debug,
+    )
     results = [
         (image_path, detector.detect_from_mrz(image_path))
         for image_path in arguments.mrz

@@ -1,8 +1,10 @@
+from collections import Counter
 from dataclasses import dataclass
 from importlib import import_module
 import logging
 import os
 from pathlib import Path
+import time
 from typing import Callable
 
 from . import FINDetectionOutput
@@ -13,6 +15,7 @@ from .preprocessor import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
 _DLL_DIRECTORY_HANDLES: list[object] = []
+PRODUCTION_OCR_VERSION = "PP-OCRv3"
 
 
 class OCRProcessingError(RuntimeError):
@@ -23,7 +26,6 @@ class OCRProcessingError(RuntimeError):
 class OCRAttempt:
     name: str
     image_factory: Callable[[], object | None]
-    is_cropped: bool
 
 
 def configure_nvidia_dll_directories() -> None:
@@ -44,10 +46,19 @@ def configure_nvidia_dll_directories() -> None:
 
 
 class FINDetector:
+    RECOVERY_ATTEMPTS = frozenset(
+        {
+            "deskewed_mrz_roi",
+            "deskewed_mrz_strip",
+            "deskewed_mrz_strip_binarized",
+            "full_image",
+            "deskewed_full_image",
+        }
+    )
     def __init__(
         self,
         use_gpu: bool = True,
-        debug: bool = False,
+        save_debug_images: bool = False,
         max_ocr_side: int = ImagePreprocessor.DEFAULT_MAX_OCR_SIDE,
         det_limit_side_len: int = 960,
     ):
@@ -64,7 +75,9 @@ class FINDetector:
             )
 
         logger.info(
-            "Initializing FINDetector (use_gpu=%s, debug=%s)", use_gpu, debug
+            "Initializing FINDetector (use_gpu=%s, save_debug_images=%s)",
+            use_gpu,
+            save_debug_images,
         )
         ocr_engine = PaddleOCR(
             use_angle_cls=False,
@@ -74,10 +87,11 @@ class FINDetector:
             max_text_length=40,
             det_limit_side_len=det_limit_side_len,
             det_limit_type="max",
+            ocr_version=PRODUCTION_OCR_VERSION,
         )
         self.preprocessor = ImagePreprocessor()
         self.mrz_extractor = MRZExtractor(ocr_engine)
-        self.debug = debug
+        self.save_debug_images = save_debug_images
         self.max_ocr_side = max_ocr_side
 
     def detect_from_mrz(self, image_path: str | Path) -> FINDetectionOutput:
@@ -93,40 +107,91 @@ class FINDetector:
             )
             attempts = self._build_attempts(rectified)
             attempted_results = []
-            mrz_result = None
+            valid_results = []
             for attempt in attempts:
+                fin_counts = Counter(
+                    result.fin for result in valid_results if result.fin
+                )
+                has_conflict = len(fin_counts) > 1
+                strongest_consensus = max(
+                    fin_counts.values(),
+                    default=0,
+                )
+                if (
+                    attempt.name in self.RECOVERY_ATTEMPTS
+                    and strongest_consensus >= 2
+                    and not has_conflict
+                ):
+                    break
                 attempt_image = attempt.image_factory()
                 if attempt_image is None:
                     continue
+                attempt_started = time.perf_counter()
                 attempted_result = self.mrz_extractor.extract(
                     attempt_image,
-                    is_cropped=attempt.is_cropped,
                     attempt=attempt.name,
+                )
+                attempt_seconds = time.perf_counter() - attempt_started
+                notes.append(
+                    f"OCR attempt {attempt.name}: "
+                    f"{attempt_seconds:.4f}s."
+                )
+                logger.info(
+                    "OCR attempt %s for %s completed in %.4fs",
+                    attempt.name,
+                    image_path.name,
+                    attempt_seconds,
                 )
                 attempted_results.append(attempted_result)
                 if self.mrz_extractor.is_structurally_valid(
                     attempted_result
                 ):
-                    mrz_result = attempted_result
-                    notes.append(
-                        f"FIN extracted using {attempt.name}."
+                    valid_results.append(attempted_result)
+                    agreement = sum(
+                        result.fin == attempted_result.fin
+                        for result in valid_results
                     )
-                    break
-            else:
-                if attempted_results:
-                    mrz_result = max(
-                        attempted_results,
-                        key=lambda result: result.confidence,
-                    )
+                    distinct_fins = {
+                        result.fin for result in valid_results if result.fin
+                    }
+                    if agreement >= 2 and len(distinct_fins) == 1:
+                        notes.append(
+                            "Strong FIN consensus reached after "
+                            f"{attempt.name}."
+                        )
+                        break
+
+            if valid_results:
+                fin_counts = Counter(
+                    result.fin for result in valid_results if result.fin
+                )
+                mrz_result = max(
+                    valid_results,
+                    key=lambda result: self._result_rank(
+                        result,
+                        fin_counts,
+                    ),
+                )
+                notes.append(
+                    f"FIN selected from {mrz_result.method} with "
+                    f"{fin_counts[mrz_result.fin]} agreeing attempt(s)."
+                )
+            elif attempted_results:
+                mrz_result = max(
+                    attempted_results,
+                    key=lambda result: result.confidence,
+                )
                 notes.append(
                     "MRZ region was not reliably detected, or OCR output "
                     "did not contain a valid TD1/TD2 structure."
                 )
+            else:
+                mrz_result = None
 
             if mrz_result is None:
                 raise RuntimeError("OCR attempt pipeline produced no result.")
 
-            if self.debug:
+            if self.save_debug_images:
                 annotated = draw_mrz_debug(
                     rectified,
                     mrz_result.line1,
@@ -148,14 +213,31 @@ class FINDetector:
                 f"Failed to process MRZ image {image_path.name}."
             ) from exc
 
+    @staticmethod
+    def _result_rank(result, fin_counts: Counter) -> tuple:
+        return (
+            fin_counts[result.fin],
+            int(result.checksum_valid)
+            + int(result.secondary_checksum_valid),
+            int(result.fin_is_canonical),
+            result.quality_score,
+            result.confidence,
+        )
+
     def _build_attempts(self, rectified) -> list[OCRAttempt]:
         deskewed_cache: dict[str, object] = {}
 
-        def prepare_crop(image, *, binarize: bool = False):
+        def prepare_crop(
+            image,
+            *,
+            binarize: bool = False,
+            adaptive_upscale: bool = False,
+        ):
             return self.preprocessor.bound_ocr_input(
                 self.preprocessor.prepare_mrz_for_ocr(
                     image,
                     binarize=binarize,
+                    adaptive_upscale=adaptive_upscale,
                 ),
                 self.max_ocr_side,
             )
@@ -172,16 +254,26 @@ class FINDetector:
             deskewed = deskewed_cache["image"]
             return None if deskewed is rectified else deskewed
 
-        def get_strip(ratio: float, *, binarize: bool = False, source=None):
-            base = rectified if source is None else source
-            strip = self.preprocessor.crop_mrz_strip(base, height_ratio=ratio)
+        def get_strip(ratio: float, *, binarize: bool = False):
+            strip = self.preprocessor.crop_mrz_strip(
+                rectified,
+                height_ratio=ratio,
+            )
             return prepare_crop(strip, binarize=binarize)
 
         def get_deskewed_strip(ratio: float, *, binarize: bool = False):
-            deskewed = get_deskewed()
-            if deskewed is None:
+            strip = self.preprocessor.crop_mrz_strip(
+                rectified,
+                height_ratio=ratio,
+            )
+            deskewed = self.preprocessor.deskew_mrz_strip(strip)
+            if deskewed is strip:
                 return None
-            return get_strip(ratio, binarize=binarize, source=deskewed)
+            return prepare_crop(
+                deskewed,
+                binarize=binarize,
+                adaptive_upscale=True,
+            )
 
         def get_deskewed_mrz_roi(*, binarize: bool = False):
             deskewed = get_deskewed()
@@ -202,7 +294,22 @@ class FINDetector:
                 image_factory=lambda: get_strip(
                     self.preprocessor.MRZ_HEIGHT_RATIO
                 ),
-                is_cropped=True,
+            ),
+            OCRAttempt(
+                name="mrz_roi",
+                image_factory=lambda: get_mrz_roi(rectified),
+            ),
+            OCRAttempt(
+                name="mrz_strip_wide",
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO_WIDE
+                ),
+            ),
+            OCRAttempt(
+                name="mrz_strip_tight",
+                image_factory=lambda: get_strip(
+                    self.preprocessor.MRZ_HEIGHT_RATIO_TIGHT
+                ),
             ),
             OCRAttempt(
                 name="mrz_strip_binarized",
@@ -210,43 +317,20 @@ class FINDetector:
                     self.preprocessor.MRZ_HEIGHT_RATIO,
                     binarize=True,
                 ),
-                is_cropped=True,
-            ),
-            OCRAttempt(
-                name="mrz_roi",
-                image_factory=lambda: get_mrz_roi(rectified),
-                is_cropped=True,
             ),
             OCRAttempt(
                 name="mrz_roi_binarized",
                 image_factory=lambda: get_mrz_roi(rectified, binarize=True),
-                is_cropped=True,
-            ),
-            OCRAttempt(
-                name="mrz_strip_wide",
-                image_factory=lambda: get_strip(
-                    self.preprocessor.MRZ_HEIGHT_RATIO_WIDE
-                ),
-                is_cropped=True,
-            ),
-            OCRAttempt(
-                name="mrz_strip_tight",
-                image_factory=lambda: get_strip(
-                    self.preprocessor.MRZ_HEIGHT_RATIO_TIGHT
-                ),
-                is_cropped=True,
             ),
             OCRAttempt(
                 name="deskewed_mrz_roi",
                 image_factory=lambda: get_deskewed_mrz_roi(),
-                is_cropped=True,
             ),
             OCRAttempt(
                 name="deskewed_mrz_strip",
                 image_factory=lambda: get_deskewed_strip(
                     self.preprocessor.MRZ_HEIGHT_RATIO
                 ),
-                is_cropped=True,
             ),
             OCRAttempt(
                 name="deskewed_mrz_strip_binarized",
@@ -254,7 +338,6 @@ class FINDetector:
                     self.preprocessor.MRZ_HEIGHT_RATIO,
                     binarize=True,
                 ),
-                is_cropped=True,
             ),
             OCRAttempt(
                 name="full_image",
@@ -262,11 +345,9 @@ class FINDetector:
                     rectified,
                     self.max_ocr_side,
                 ),
-                is_cropped=False,
             ),
             OCRAttempt(
                 name="deskewed_full_image",
                 image_factory=get_deskewed_full,
-                is_cropped=False,
             ),
         ]

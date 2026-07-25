@@ -18,16 +18,6 @@ class ServiceResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     services: list[str] = Field(default_factory=list)
-    ocr_max_concurrency: int | None = Field(
-        None,
-        description="Max ID images that can run on the GPU at once.",
-        examples=[2],
-    )
-    ocr_available_workers: int | None = Field(
-        None,
-        description="Idle OCR workers ready to accept work right now.",
-        examples=[2],
-    )
 
 
 class MRZDetails(BaseModel):

@@ -12,15 +12,16 @@ Passport OCR is registered as a placeholder for the next service.
 | `POST` | `/v1/id-fin` | Yes | Available |
 | `POST` | `/v1/id-fin/batch` | Yes | Multiple MRZ images |
 | `POST` | `/v1/passport` | Yes | Returns `501` until implemented |
-| `GET` | `/docs` | No | OpenAPI documentation |
+| `GET` | `/docs` | No | Interactive OpenAPI documentation |
 
-Inbound `/v1/*` calls are written locally for audit:
-- metadata and full JSON responses in `AUDIT_DB_PATH` (default `data/audit.db`)
-- uploaded images and request bodies in `AUDIT_PAYLOAD_DIR`
-  (default `data/audit_payloads`)
+Inbound `/v1/*` calls are written locally as redacted metadata. FIN values,
+serial numbers, MRZ lines, and full response bodies are not retained. Raw
+uploads are disabled by default; `AUDIT_STORE_PAYLOADS=true` enables bounded
+retention under `AUDIT_PAYLOAD_DIR`, controlled by `AUDIT_RETENTION_DAYS` and
+`AUDIT_MAX_PAYLOAD_BYTES`.
 
 Open the Streamlit **Integration Audit** page to inspect volume, outcomes,
-saved payloads, and response bodies.
+saved payloads, and redacted response summaries.
 
 ## Setup
 
@@ -33,23 +34,28 @@ python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Replace the example value in `.env` with a long random key. Multiple keys may
-be configured as a comma-separated list:
+Replace the example value in `.env` with a random key of at least 32
+characters. Multiple unique keys may be configured as a comma-separated list:
 
 ```dotenv
-API_KEYS=first-client-key,second-client-key
+API_KEYS=replace-with-a-cryptographically-random-32-plus-character-key
 ```
 
 GPU acceleration is enabled by default with `USE_GPU=true`, and the project
 installs `paddlepaddle-gpu`. A compatible NVIDIA driver is required. The CLI
 also uses GPU by default; pass `--cpu` only for an explicit CPU run.
 
-Start the API from the repository root (one process — the in-app GPU pool
-handles parallelism; do not raise uvicorn `--workers` above 1 on the OCR host):
+For local use, start the API from the repository root. One OCR engine
+serializes inference on a background thread, so do not raise uvicorn
+`--workers` above 1:
 
 ```powershell
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
+
+For remote integrations, terminate TLS at a trusted reverse proxy and proxy
+to `127.0.0.1:8000`. Never expose port 8000 directly: API keys, identity
+images, and OCR responses are sensitive.
 
 To start both the FastAPI backend and Streamlit frontend in separate windows,
 double-click `run.bat` or run:
@@ -59,8 +65,9 @@ double-click `run.bat` or run:
 ```
 
 The script works from any current directory, uses `.venv` when present,
-creates `.env` from the example when missing, and installs missing
-dependencies.
+creates `.env` with a random API key when missing, and installs missing
+dependencies. It binds both applications to loopback. Streamlit has no remote
+login and must never be exposed directly or reverse-proxied publicly.
 
 PaddleOCR downloads its model files when the ID FIN service is used for the
 first time. The detector is then reused for later requests.
@@ -71,8 +78,8 @@ Upload the card side containing the MRZ using the required `mrz` field. This
 is the front side on older 2-line cards and the back side on new 3-line cards:
 
 ```powershell
-curl.exe -X POST "http://localhost:8000/v1/id-fin" `
-  -H "X-API-Key: first-client-key" `
+curl.exe -X POST "https://ocr.example.internal/v1/id-fin" `
+  -H "X-API-Key: your-random-32-plus-character-key" `
   -F "mrz=@C:\images\id-back.jpg"
 ```
 
@@ -105,39 +112,38 @@ validated.
 For multiple cards, repeat the `mrz` multipart field:
 
 ```powershell
-curl.exe -X POST "http://localhost:8000/v1/id-fin/batch" `
-  -H "X-API-Key: first-client-key" `
+curl.exe -X POST "https://ocr.example.internal/v1/id-fin/batch" `
+  -H "X-API-Key: your-random-32-plus-character-key" `
   -F "mrz=@C:\images\first-back.jpg" `
   -F "mrz=@C:\images\second-back.jpg"
 ```
 
 Batch responses contain `data.count` and an ordered `data.results` list. Each
 result includes `index`, `file_name`, `fin`, `confidence`, `mrz_details`, and
-`notes`. Batch items and concurrent HTTP requests share a bounded GPU worker
-pool (`OCR_MAX_CONCURRENCY`). Extra requests wait for a free worker instead of
-overloading VRAM.
+`notes`. One PaddleOCR engine processes batch items sequentially. This keeps
+GPU memory use predictable and avoids multiple model copies competing on the
+same device.
 
-| Host | Suggested `OCR_MAX_CONCURRENCY` |
-| --- | --- |
-| Dev laptop (6–8 GB VRAM) | `1`–`2` |
-| Mid GPU (12–16 GB) | `3`–`4` |
-| Core PC (RTX 5090 32 GB + 14700K / 64 GB RAM) | `8` (start), `10`–`12` if VRAM headroom remains |
-
-On the core server, set in `.env`:
+Recommended `.env` values:
 
 ```dotenv
 USE_GPU=true
-OCR_MAX_CONCURRENCY=8
-MAX_BATCH_FILES=20
+SAVE_OCR_DEBUG_IMAGES=false
+MAX_BATCH_FILES=100
 ```
+
+Production is permanently pinned to PP-OCRv3 in code. Keep
+`SAVE_OCR_DEBUG_IMAGES=false` unless troubleshooting locally because enabling
+it writes annotated identity images to disk.
 
 Each image is limited by `MAX_UPLOAD_BYTES` (10 MiB by default) and
 `MAX_IMAGE_PIXELS` (25 megapixels by default). File signatures are verified
-before OCR. A batch accepts at most `MAX_BATCH_FILES` images (20 on the core
-PC example above). Uploaded files are stored in a request-specific temporary
-directory and removed after processing.
+before OCR. A batch accepts at most `MAX_BATCH_FILES` images (100 by default)
+and `MAX_BATCH_BYTES` total bytes. Uploaded working files are
+removed after processing. The application does not impose a global HTTP
+request or per-key request-rate limit.
 
-`/health` reports configured OCR capacity without loading GPU models. A valid
+`/health` reports API availability without loading GPU models. A valid
 image where no FIN can be found returns `200` with `fin: null`; an OCR engine
 failure returns `500` with error code `ocr_processing_failed`.
 
@@ -147,7 +153,6 @@ failure returns `500` with error code `ocr_processing_failed`.
 api/                    FastAPI application, authentication, schemas, routes
 services/
   id_fin/               Azerbaijani ID FIN OCR engine and service adapter
-  passport/             Passport service placeholder
 shared/                 Configuration and secure upload handling
 demos/
   streamlit_app.py      Internal Streamlit demo (top-tab navigation)
@@ -160,9 +165,8 @@ benchmarks/             PII-safe local accuracy and GPU performance harness
 ```
 
 The HTTP route handles transport and validation. Each package under
-`services/` owns its OCR implementation. `IDFinService` keeps a pool of
-PaddleOCR workers and runs inference on a thread-pool executor so many
-requests can progress at once up to `OCR_MAX_CONCURRENCY`.
+`services/` owns its OCR implementation. `IDFinService` keeps one PaddleOCR
+engine and runs inference on a single background executor thread.
 
 ## Add another OCR service
 
@@ -176,11 +180,12 @@ requests can progress at once up to `OCR_MAX_CONCURRENCY`.
 
 ```powershell
 python demos\cli.py --mrz C:\images\first-back.jpg C:\images\second-back.jpg --output json
-streamlit run demos\streamlit_app.py
+streamlit run demos\streamlit_app.py --server.address 127.0.0.1
 ```
 
 In Streamlit, use the top **Integration Audit** tab to inspect third-party
-API traffic recorded while the FastAPI backend is running.
+API traffic recorded while the FastAPI backend is running. Keep Streamlit on
+`127.0.0.1`; its audit data is operationally sensitive.
 
 ## Tests
 
@@ -196,10 +201,11 @@ PaddleOCR models or require real identity documents.
 
 This service remains a PaddleOCR GPU pipeline; it does not use ONNX Runtime.
 
-Create an ignored private fixture manifest from
-`benchmarks/fixtures.example.json`. Store only SHA-256 hashes of expected FIN
-values and never commit card images, local manifests, benchmark result files,
-or raw FIN values.
+Create an ignored private fixture manifest with
+`python benchmarks\build_manifest.py --images C:\private\id-fin-corpus`.
+The builder stores only SHA-256 hashes of expected FIN/serial values. Never
+commit card images, local manifests, benchmark result files, or raw identity
+values.
 
 ```powershell
 python benchmarks\benchmark_id_fin.py `
@@ -210,17 +216,11 @@ python benchmarks\benchmark_id_fin.py `
   --output benchmarks\results-final.local.json
 ```
 
-On Windows 11, Python 3.12.10, PaddlePaddle GPU 2.6.2, CUDA 11.8, cuDNN 8.6,
-and an NVIDIA GeForce RTX 4060 Laptop GPU, the two-card TD1/TD2 fixture set
-improved from 170.9 ms to 126.2 ms warm median latency. Throughput increased
-from 5.89 to 8.05 images/s, full-image fallback fell from 50% to 0%, and all
-expected FIN/card-type results remained unchanged.
-
-The optimized pipeline localizes the card and tries lazy attempts in order:
-cleaned bottom strip, detected MRZ rectangle, deskewed MRZ rectangle,
-deskewed strip, bounded full card, and deskewed bounded full card. It stops at
-the first structurally accepted result, so successful fast-path cards do not
-pay for MRZ localization, deskew, or full-image OCR.
+The PP-OCRv3 pipeline collects fast grayscale candidates before binarized
+recovery. Matching FIN values can stop early; a lone or conflicting candidate
+triggers deskew/full-image recovery. Selection prioritizes cross-attempt
+agreement, TD1/TD2 checksum evidence, canonical field position, candidate
+quality, and OCR confidence rather than accepting the first plausible FIN.
 
 TD1 and TD2 candidates are evaluated together rather than letting one format
 block the other. Candidate scoring uses MRZ structure, line lengths, OCR

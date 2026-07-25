@@ -10,6 +10,8 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -24,8 +26,8 @@ def fingerprint_api_key(api_key: str | None) -> str | None:
 
 
 def label_api_key(api_key: str, index: int) -> str:
-    suffix = api_key[-4:] if len(api_key) >= 4 else api_key
-    return f"client-{index + 1} (…{suffix})"
+    del api_key
+    return f"client-{index + 1}"
 
 
 def service_from_path(path: str) -> str | None:
@@ -170,15 +172,22 @@ class AuditStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.payload_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._last_prune_at = 0.0
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, check_same_thread=False)
+        connection = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=5.0,
+        )
+        connection.execute("PRAGMA busy_timeout = 5000")
         connection.row_factory = sqlite3.Row
         return connection
 
     def _initialize(self) -> None:
         with self._lock, self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS api_audit_events (
@@ -360,10 +369,124 @@ class AuditStore:
             / stamp.strftime("%Y")
             / stamp.strftime("%m")
             / stamp.strftime("%d")
-            / stamp.strftime("%H%M%S%f")
+            / f"{stamp.strftime('%H%M%S%f')}-{uuid.uuid4().hex[:8]}"
         )
         directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    def can_store_payload(
+        self,
+        additional_bytes: int,
+        max_payload_bytes: int,
+    ) -> bool:
+        if max_payload_bytes <= 0:
+            return False
+        current_bytes = sum(
+            path.stat().st_size
+            for path in self.payload_dir.rglob("*")
+            if path.is_file()
+        )
+        return current_bytes + additional_bytes <= max_payload_bytes
+
+    def maybe_prune(
+        self,
+        *,
+        retention_days: int,
+        max_payload_bytes: int,
+    ) -> None:
+        now = time.monotonic()
+        if now - self._last_prune_at < 300:
+            return
+        self.prune(
+            retention_days=retention_days,
+            max_payload_bytes=max_payload_bytes,
+        )
+        self._last_prune_at = now
+
+    def prune(
+        self,
+        *,
+        retention_days: int,
+        max_payload_bytes: int,
+    ) -> dict[str, int]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=retention_days)
+        ).isoformat()
+        with self._lock, self._connect() as connection:
+            expired_rows = connection.execute(
+                """
+                SELECT payload_dir
+                FROM api_audit_events
+                WHERE created_at < ? AND payload_dir IS NOT NULL
+                """,
+                (cutoff,),
+            ).fetchall()
+            deleted_events = connection.execute(
+                "DELETE FROM api_audit_events WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+            connection.commit()
+
+        deleted_payloads = self._delete_payload_rows(expired_rows)
+        payload_bytes = self._payload_size()
+        if payload_bytes > max_payload_bytes:
+            with self._lock, self._connect() as connection:
+                quota_rows = connection.execute(
+                    """
+                    SELECT id, payload_dir
+                    FROM api_audit_events
+                    WHERE payload_dir IS NOT NULL
+                    ORDER BY created_at ASC
+                    """
+                ).fetchall()
+                for row in quota_rows:
+                    if payload_bytes <= max_payload_bytes:
+                        break
+                    removed = self._delete_payload_rows([row])
+                    if removed:
+                        payload_bytes = self._payload_size()
+                        deleted_payloads += removed
+                    connection.execute(
+                        """
+                        UPDATE api_audit_events
+                        SET payload_dir = NULL, request_files_json = '[]'
+                        WHERE id = ?
+                        """,
+                        (row["id"],),
+                    )
+                connection.commit()
+        return {
+            "events": deleted_events,
+            "payload_directories": deleted_payloads,
+        }
+
+    def _payload_size(self) -> int:
+        return sum(
+            path.stat().st_size
+            for path in self.payload_dir.rglob("*")
+            if path.is_file()
+        )
+
+    def _delete_payload_rows(self, rows: list[Any]) -> int:
+        payload_root = self.payload_dir.resolve()
+        data_root = payload_root.parent
+        deleted = 0
+        for row in rows:
+            raw_value = row["payload_dir"]
+            if not raw_value:
+                continue
+            raw_path = Path(raw_value)
+            candidate = (
+                raw_path.resolve()
+                if raw_path.is_absolute()
+                else (data_root / raw_path).resolve()
+            )
+            if candidate == payload_root or payload_root not in candidate.parents:
+                continue
+            if candidate.is_dir():
+                shutil.rmtree(candidate)
+                deleted += 1
+        return deleted
 
     def clear_all(self) -> dict[str, int]:
         with self._lock, self._connect() as connection:
@@ -472,7 +595,6 @@ class AuditStore:
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
-            "success_rate": (succeeded / total * 100.0) if total else 0.0,
             "ocr_detected": ocr_detected,
             "ocr_not_found": ocr_not_found,
             "detection_rate": (
@@ -492,7 +614,6 @@ class AuditStore:
         hours: int | None = 24,
         service: str | None = None,
         success: bool | None = None,
-        fin_not_found: bool = False,
     ) -> list[AuditEvent]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -506,13 +627,6 @@ class AuditStore:
         if success is not None:
             clauses.append("success = ?")
             params.append(int(success))
-        if fin_not_found:
-            clauses.append(
-                "("
-                "LOWER(COALESCE(result_summary, '')) LIKE '%fin not found%' "
-                "OR LOWER(COALESCE(result_summary, '')) LIKE '%no fin found%'"
-                ")"
-            )
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)

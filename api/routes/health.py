@@ -1,9 +1,6 @@
-from typing import Annotated
-
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from api.schemas import HealthResponse
-from shared.config import Settings, get_settings
 
 
 router = APIRouter(tags=["health"])
@@ -14,14 +11,10 @@ router = APIRouter(tags=["health"])
     response_model=HealthResponse,
     summary="Health check",
     description=(
-        "Returns API status, registered OCR services, and GPU worker capacity."
+        "Returns API status and registered OCR services."
     ),
 )
-def health(
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> HealthResponse:
+def health() -> HealthResponse:
     return HealthResponse(
         services=["id-fin"],
-        ocr_max_concurrency=settings.ocr_max_concurrency,
-        ocr_available_workers=None,
     )

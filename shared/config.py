@@ -49,13 +49,16 @@ def _bounded_int(
 class Settings:
     api_keys: tuple[str, ...]
     use_gpu: bool
-    debug: bool
+    save_ocr_debug_images: bool
     max_upload_bytes: int
     max_image_pixels: int
     max_batch_files: int
-    ocr_max_concurrency: int
     audit_db_path: Path
     audit_payload_dir: Path
+    max_batch_bytes: int = 50 * 1024 * 1024
+    audit_store_payloads: bool = False
+    audit_retention_days: int = 30
+    audit_max_payload_bytes: int = 1024 * 1024 * 1024
 
 
 @lru_cache(maxsize=1)
@@ -68,20 +71,26 @@ def get_settings() -> Settings:
     return Settings(
         api_keys=api_keys,
         use_gpu=_as_bool(os.getenv("USE_GPU"), default=True),
-        debug=_as_bool(os.getenv("DEBUG")),
-        max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
-        max_image_pixels=int(os.getenv("MAX_IMAGE_PIXELS", "25000000")),
+        save_ocr_debug_images=_as_bool(
+            os.getenv("SAVE_OCR_DEBUG_IMAGES"),
+        ),
+        max_upload_bytes=_bounded_int(
+            "MAX_UPLOAD_BYTES",
+            10 * 1024 * 1024,
+            minimum=1_024,
+            maximum=100 * 1024 * 1024,
+        ),
+        max_image_pixels=_bounded_int(
+            "MAX_IMAGE_PIXELS",
+            25_000_000,
+            minimum=1,
+            maximum=100_000_000,
+        ),
         max_batch_files=_bounded_int(
             "MAX_BATCH_FILES",
-            20,
+            100,
             minimum=1,
             maximum=1_000,
-        ),
-        ocr_max_concurrency=_bounded_int(
-            "OCR_MAX_CONCURRENCY",
-            2,
-            minimum=1,
-            maximum=32,
         ),
         audit_db_path=_resolve_path(
             os.getenv("AUDIT_DB_PATH", str(DEFAULT_AUDIT_DB_PATH)),
@@ -91,4 +100,45 @@ def get_settings() -> Settings:
             os.getenv("AUDIT_PAYLOAD_DIR", str(DEFAULT_AUDIT_PAYLOAD_DIR)),
             DEFAULT_AUDIT_PAYLOAD_DIR,
         ),
+        max_batch_bytes=_bounded_int(
+            "MAX_BATCH_BYTES",
+            50 * 1024 * 1024,
+            minimum=1_024,
+            maximum=1024 * 1024 * 1024,
+        ),
+        audit_store_payloads=_as_bool(
+            os.getenv("AUDIT_STORE_PAYLOADS"),
+        ),
+        audit_retention_days=_bounded_int(
+            "AUDIT_RETENTION_DAYS",
+            30,
+            minimum=1,
+            maximum=3_650,
+        ),
+        audit_max_payload_bytes=_bounded_int(
+            "AUDIT_MAX_PAYLOAD_BYTES",
+            1024 * 1024 * 1024,
+            minimum=0,
+            maximum=1024 * 1024 * 1024 * 1024,
+        ),
     )
+
+
+def validate_security_settings(settings: Settings) -> None:
+    if not settings.api_keys:
+        raise ValueError("API_KEYS must contain at least one key.")
+    if len(set(settings.api_keys)) != len(settings.api_keys):
+        raise ValueError("API_KEYS must not contain duplicate keys.")
+    for key in settings.api_keys:
+        if key == "replace-with-a-long-random-key" or len(key) < 32:
+            raise ValueError(
+                "Every API key must be random and at least 32 characters."
+            )
+    if (
+        settings.audit_store_payloads
+        and settings.audit_max_payload_bytes <= 0
+    ):
+        raise ValueError(
+            "AUDIT_MAX_PAYLOAD_BYTES must be positive when payload "
+            "retention is enabled."
+        )

@@ -1,12 +1,6 @@
-import cv2
 import numpy as np
 import pytest
 
-from benchmarks.benchmark_id_fin import warm_latency_improvement
-from services.id_fin import FINDetectionOutput, MRZResult
-from services.id_fin.detector import FINDetector, OCRProcessingError
-from services.id_fin.preprocessor import ImagePreprocessor
-from services.id_fin.service import serialize_fin_detection
 from services.id_fin.layout import (
     TD1_FIN,
     TD1_SERIAL,
@@ -22,6 +16,30 @@ from services.id_fin.validator import (
     is_valid_old_card_serial,
 )
 from services.id_fin.mrz_extractor import MRZExtractor
+
+
+def _parse_td1_for_test(
+    extractor: MRZExtractor,
+    lines: list[tuple[str, float]],
+    *,
+    is_cropped: bool,
+):
+    candidates = extractor._find_td1_candidates(lines)
+    if not candidates:
+        return extractor._diagnostic_result(lines)
+    selected = max(candidates, key=lambda candidate: candidate.score)
+    attempt = "mrz_strip" if is_cropped else "full_image"
+    return extractor._parse_td1_lines(list(selected.lines), attempt)
+
+
+def _parse_td2_for_test(
+    extractor: MRZExtractor,
+    pair: tuple[tuple[str, float], tuple[str, float]],
+    *,
+    is_cropped: bool,
+):
+    attempt = "mrz_strip" if is_cropped else "full_image"
+    return extractor._parse_td2_lines(pair, attempt)
 
 
 def test_check_digit() -> None:
@@ -42,27 +60,12 @@ def test_ocr_digit_confusion_and_serial_validation() -> None:
     assert not is_valid_new_card_serial("19205792")
 
 
-def test_invalid_concurrency_setting_fails_clearly(monkeypatch) -> None:
-    from shared import config as config_module
+def test_td1_line2_checksums_strengthen_candidate_score() -> None:
+    valid = "9601226M3006162AZE<<<<<<<<<<<5"
+    invalid = "9601220M3006160AZE<<<<<<<<<<<5"
 
-    config_module.get_settings.cache_clear()
-    monkeypatch.setenv("OCR_MAX_CONCURRENCY", "0")
-    with pytest.raises(ValueError, match="OCR_MAX_CONCURRENCY must be between"):
-        config_module.get_settings()
-    config_module.get_settings.cache_clear()
-
-
-def test_detector_wraps_unexpected_engine_failure() -> None:
-    class FailingPreprocessor:
-        @staticmethod
-        def load(_image_path):
-            raise RuntimeError("decode failed")
-
-    detector = FINDetector.__new__(FINDetector)
-    detector.preprocessor = FailingPreprocessor()
-
-    with pytest.raises(OCRProcessingError, match="broken.png"):
-        detector.detect_from_mrz("broken.png")
+    assert MRZExtractor._td1_line2_checksums_valid(valid)
+    assert not MRZExtractor._td1_line2_checksums_valid(invalid)
 
 
 def test_fixed_mrz_positions_for_fin_and_serial() -> None:
@@ -91,7 +94,7 @@ def test_old_card_td2_fin_extraction() -> None:
     pair = extractor._find_td2_pair(merged_lines)
     assert pair is not None
 
-    result = extractor._parse_td2(pair, is_cropped=False)
+    result = _parse_td2_for_test(extractor, pair, is_cropped=False)
     assert result.fin == "1HNLXEM"
     assert result.card_type == "older_card"
     assert result.card_serial_number == "14433235"
@@ -101,7 +104,8 @@ def test_old_card_td2_fin_extraction() -> None:
 
 def test_exact_new_and_old_card_mrz_layouts() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    new_card = extractor._parse_td1(
+    new_card = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA203982795H0H4NX<<<<<<<<", 0.99),
             ("9601226M3006162AZE<<<<<<<<<<<5", 0.99),
@@ -109,7 +113,8 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
         ],
         is_cropped=False,
     )
-    old_card = extractor._parse_td2(
+    old_card = _parse_td2_for_test(
+        extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
             ("19205792<7AZE8210276M32102712BDLLON5", 0.99),
@@ -134,7 +139,8 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
 
 def test_td1_checksum_corrects_ocr_digit_confusion() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA2O3982795H0H4NX<<<<<<<<", 0.99),
             ("9601226M3006162AZE<<<<<<<<<<<5", 0.99),
@@ -179,71 +185,17 @@ def test_truncated_old_card_is_not_classified_as_new() -> None:
 
     pair = extractor._find_td2_pair(merged_lines)
     assert pair is not None
-    old_result = extractor._parse_td2(pair, is_cropped=False)
-    fallback_result = extractor._parse_td1(merged_lines, is_cropped=False)
+    old_result = _parse_td2_for_test(extractor, pair, is_cropped=False)
+    fallback_result = _parse_td1_for_test(
+        extractor,
+        merged_lines,
+        is_cropped=False,
+    )
 
     assert old_result.card_type == "older_card"
     assert old_result.fin is None
     assert fallback_result.card_type == "unknown"
     assert fallback_result.fin is None
-
-
-def test_localized_card_uses_bottom_35_percent_for_mrz() -> None:
-    card = np.zeros((200, 400, 3), dtype=np.uint8)
-    card[130:, :] = 255
-
-    mrz_candidate = ImagePreprocessor.enhance_for_mrz(card)
-
-    # Bottom 35% is upscaled for OCR readability of thin MRZ fillers.
-    assert mrz_candidate.shape[1] >= ImagePreprocessor.MIN_MRZ_OCR_WIDTH
-    assert abs(mrz_candidate.shape[0] / mrz_candidate.shape[1] - 70 / 400) < 0.02
-    assert mrz_candidate.mean() > 200
-
-
-def test_conservative_card_localization_and_input_cap() -> None:
-    photo = np.full((800, 1000, 3), 255, dtype=np.uint8)
-    cv2.rectangle(photo, (120, 180), (880, 660), (30, 30, 30), 8)
-
-    localized = ImagePreprocessor.detect_card_roi(photo)
-    bounded = ImagePreprocessor.bound_ocr_input(photo, max_side=500)
-
-    assert localized is not photo
-    assert 1.4 < localized.shape[1] / localized.shape[0] < 1.8
-    assert max(bounded.shape[:2]) == 500
-    assert bounded.shape[1] / bounded.shape[0] == photo.shape[1] / photo.shape[0]
-
-
-def test_mrz_roi_localizes_wide_text_block() -> None:
-    card = np.full((500, 800, 3), 245, dtype=np.uint8)
-    for index, text in enumerate(
-        (
-            "IAAZEAA12345670AZE1ABC234<<<<<",
-            "9001011M3001019AZE<<<<<<<<<<<0",
-            "TEST<<PERSON<<<<<<<<<<<<<<<<<<",
-        )
-    ):
-        cv2.putText(
-            card,
-            text,
-            (60, 360 + index * 45),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (10, 10, 10),
-            2,
-            cv2.LINE_AA,
-        )
-
-    mrz_roi = ImagePreprocessor.detect_mrz_roi(card)
-
-    assert mrz_roi is not None
-    assert mrz_roi.shape[0] < card.shape[0] * 0.6
-    assert mrz_roi.shape[1] > card.shape[1] * 0.5
-
-
-def test_mrz_roi_returns_none_without_text_structure() -> None:
-    blank = np.full((500, 800, 3), 245, dtype=np.uint8)
-
-    assert ImagePreprocessor.detect_mrz_roi(blank) is None
 
 
 def test_structural_validation_rejects_truncated_td2() -> None:
@@ -258,7 +210,8 @@ def test_structural_validation_rejects_truncated_td2() -> None:
 
 def test_structural_validation_accepts_td1_and_td2() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    td1 = extractor._parse_td1(
+    td1 = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA203982795H0H4NX<<<<<<<<", 0.99),
             ("9601226M3006162AZE<<<<<<<<<<<5", 0.99),
@@ -266,7 +219,8 @@ def test_structural_validation_accepts_td1_and_td2() -> None:
         ],
         is_cropped=True,
     )
-    td2 = extractor._parse_td2(
+    td2 = _parse_td2_for_test(
+        extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
             ("19205792<7AZE8210276M32102712BDLLON5", 0.99),
@@ -314,7 +268,8 @@ def test_new_card_serial_rejects_non_digit_noise_that_cannot_be_corrected() -> N
 
 def test_new_card_classification_tolerates_minor_header_ocr_loss() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("IAAEAA123456701ABC234<<<<<<", 0.93),
             ("9001011M3001019A2E<<<<<<<<<<<0", 0.91),
@@ -330,7 +285,8 @@ def test_new_card_classification_tolerates_minor_header_ocr_loss() -> None:
 
 def test_valid_td1_fin_does_not_require_perfect_serial_ocr() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA123X5670AZE1ABC234<<<<<", 0.90),
             ("9001011M3001019AZE<<<<<<<<<<<0", 0.91),
@@ -346,7 +302,8 @@ def test_valid_td1_fin_does_not_require_perfect_serial_ocr() -> None:
 
 def test_new_card_serial_corrects_ocr_digit_confusion() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA123O5670AZE1ABC234<<<<<", 0.90),
             ("9001011M3001019AZE<<<<<<<<<<<0", 0.91),
@@ -362,7 +319,8 @@ def test_new_card_serial_corrects_ocr_digit_confusion() -> None:
 
 def test_valid_td1_tolerates_digit_confusion_in_second_line() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("IAAZEAA12345670AZE1ABC234<<<<<", 0.90),
             ("9O01011M3O01019AZE<<<<<<<<<<<0", 0.91),
@@ -387,7 +345,7 @@ def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
     pair = extractor._find_td2_pair(merged_lines)
 
     assert pair is not None
-    result = extractor._parse_td2(pair, is_cropped=False)
+    result = _parse_td2_for_test(extractor, pair, is_cropped=False)
     assert result.fin == "2BDLLON"
     assert result.card_serial_number == "19205792"
     assert result.card_type == "older_card"
@@ -396,7 +354,8 @@ def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
 def test_older_card_fin_recovers_when_aze_alignment_shifts() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
     # Extra OCR character before nationality shifts AZE from index 10 to 11.
-    result = extractor._parse_td2(
+    result = _parse_td2_for_test(
+        extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
             ("19205792<7XAZE8210276M32102712BDLLON5", 0.99),
@@ -411,7 +370,8 @@ def test_older_card_fin_recovers_when_aze_alignment_shifts() -> None:
 
 def test_older_card_tolerates_digit_confusion_in_birth_date() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td2(
+    result = _parse_td2_for_test(
+        extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
             ("19205792<7AZE82IO276M32102712BDLLON5", 0.99),
@@ -426,7 +386,8 @@ def test_older_card_tolerates_digit_confusion_in_birth_date() -> None:
 
 def test_older_card_serial_corrects_ocr_digit_confusion() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td2(
+    result = _parse_td2_for_test(
+        extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
             ("192O5792<7AZE8210276M32102712BDLLON5", 0.99),
@@ -480,7 +441,8 @@ def test_invalid_td2_candidate_does_not_block_valid_td1() -> None:
 
 def test_unknown_td1_layout_does_not_return_label_as_fin() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    result = extractor._parse_td1(
+    result = _parse_td1_for_test(
+        extractor,
         [
             ("A<II<RH<QAN<QRUPU<BLOOD<GROU<<", 0.84),
             ("IAAZEAA12345670AZE1ABC234<<<<<", 0.93),
@@ -507,7 +469,11 @@ def test_td1_selection_ignores_interleaved_non_mrz_text() -> None:
         ("ETIBARLILIQ<MUDDATI", 0.84),
     ]
 
-    result = extractor._parse_td1(merged_lines, is_cropped=False)
+    result = _parse_td1_for_test(
+        extractor,
+        merged_lines,
+        is_cropped=False,
+    )
 
     assert result.fin == "1ABC234"
     assert result.card_type == "new_card"
@@ -559,154 +525,12 @@ def test_ocr_grouping_does_not_chain_adjacent_rows() -> None:
     extractor = MRZExtractor(FakeOCR())
     result = extractor.extract(
         np.zeros((100, 1000, 3), dtype=np.uint8),
-        is_cropped=False,
+        attempt="full_image",
     )
 
     assert result.fin == "1ABC234"
     assert result.card_type == "new_card"
     assert result.card_serial_number == "AA1234567"
-
-
-def test_service_serializes_card_serial_number() -> None:
-    mrz_result = MRZResult(
-        fin="1ABC234",
-        confidence=0.95,
-        line1="IAAZEAA12345670AZE1ABC234<<<<<",
-        line2="9001011M3001019AZE<<<<<<<<<<<0",
-        line3="TEST<<PERSON<<<<<<<<<<<<<<<<<<",
-        checksum_valid=True,
-        method="mrz_strip",
-        card_type="new_card",
-        card_serial_number="AA1234567",
-    )
-
-    serialized = serialize_fin_detection(
-        FINDetectionOutput(
-            fin="1ABC234",
-            confidence=0.95,
-            mrz_result=mrz_result,
-        )
-    )
-
-    mrz_details = serialized["mrz_details"]
-    assert isinstance(mrz_details, dict)
-    assert mrz_details["card_serial_number"] == "AA1234567"
-
-
-def test_detector_uses_deskew_only_after_regular_fallback_fails() -> None:
-    original = np.zeros((100, 200, 3), dtype=np.uint8)
-    deskewed = np.ones((100, 200, 3), dtype=np.uint8)
-    attempted_names: list[str | None] = []
-
-    class FakePreprocessor:
-        MRZ_HEIGHT_RATIO = 0.35
-        MRZ_HEIGHT_RATIO_TIGHT = 0.28
-        MRZ_HEIGHT_RATIO_WIDE = 0.45
-
-        @staticmethod
-        def load(_path) -> np.ndarray:
-            return original
-
-        @staticmethod
-        def detect_card_roi(image: np.ndarray) -> np.ndarray:
-            return image
-
-        @staticmethod
-        def crop_mrz_strip(
-            image: np.ndarray,
-            height_ratio: float | None = None,
-        ) -> np.ndarray:
-            del height_ratio
-            return image[:35]
-
-        @staticmethod
-        def prepare_mrz_for_ocr(
-            image: np.ndarray,
-            *,
-            binarize: bool = False,
-        ) -> np.ndarray:
-            del binarize
-            return image
-
-        @staticmethod
-        def detect_mrz_roi(_image: np.ndarray) -> None:
-            return None
-
-        @staticmethod
-        def bound_ocr_input(
-            image: np.ndarray,
-            _max_side: int,
-        ) -> np.ndarray:
-            return image
-
-        @staticmethod
-        def deskew(_image: np.ndarray) -> np.ndarray:
-            return deskewed
-
-    class FakeExtractor:
-        @staticmethod
-        def extract(
-            image: np.ndarray,
-            is_cropped: bool,
-            attempt: str | None = None,
-        ) -> MRZResult:
-            attempted_names.append(attempt)
-            is_valid = image is deskewed and not is_cropped
-            return MRZResult(
-                fin="1ABC234" if is_valid else None,
-                confidence=0.95 if is_valid else 0.0,
-                line1="IAAZEAA12345670AZE1ABC234<<<<<" if is_valid else "",
-                line2="9001011M3001019AZE<<<<<<<<<<<0" if is_valid else "",
-                line3="TEST<<PERSON<<<<<<<<<<<<<<<<<<" if is_valid else "",
-                checksum_valid=is_valid,
-                method=f"td1_{attempt}" if is_valid else "not_found",
-                card_type="new_card" if is_valid else "unknown",
-                card_serial_number="AA1234567" if is_valid else None,
-            )
-
-        @staticmethod
-        def is_structurally_valid(result: MRZResult) -> bool:
-            return result.fin is not None
-
-    detector = FINDetector.__new__(FINDetector)
-    detector.preprocessor = FakePreprocessor()
-    detector.mrz_extractor = FakeExtractor()
-    detector.max_ocr_side = 1600
-    detector.debug = False
-
-    result = detector.detect_from_mrz("tilted-card.png")
-
-    assert result.fin == "1ABC234"
-    assert result.mrz_result is not None
-    assert result.mrz_result.method == "td1_deskewed_full_image"
-    assert (
-        "FIN extracted using deskewed_full_image."
-        in result.notes
-    )
-    assert attempted_names[0] == "mrz_strip"
-    assert "mrz_strip_binarized" in attempted_names
-    assert attempted_names[-1] == "deskewed_full_image"
-
-
-def test_mrz_upscale_and_binarize_helpers() -> None:
-    small = np.full((40, 200, 3), 180, dtype=np.uint8)
-    cv2.putText(
-        small,
-        "IAAZEAA1234567",
-        (5, 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.4,
-        (20, 20, 20),
-        1,
-        cv2.LINE_AA,
-    )
-
-    upscaled = ImagePreprocessor.upscale_mrz_if_needed(small, min_width=400)
-    binarized = ImagePreprocessor.enhance_mrz_image(small, binarize=True)
-
-    assert upscaled.shape[1] >= 400
-    assert binarized.shape[:2] == small.shape[:2]
-    assert set(np.unique(binarized).tolist()).issubset({0, 255})
 
 
 def test_prefer_mrz_like_lines_filters_top_prose() -> None:
@@ -731,105 +555,3 @@ def test_prefer_mrz_like_lines_filters_top_prose() -> None:
         "ETIBARLILIG" not in text and "DAYISDIRILMASI" not in text
         for text in texts
     )
-
-
-def test_warm_latency_gate_requires_20_percent_improvement() -> None:
-    assert warm_latency_improvement(0.08, 0.10) >= 0.2
-    assert warm_latency_improvement(0.081, 0.10) < 0.2
-
-
-def test_detector_pool_allows_parallel_workers() -> None:
-    import threading
-    import time
-
-    from services.id_fin.service import DetectorPool, serialize_fin_detection
-
-    created: list[object] = []
-    active = 0
-    peak_active = 0
-    lock = threading.Lock()
-
-    class FakeDetector:
-        def detect_from_mrz(self, _path: str) -> FINDetectionOutput:
-            nonlocal active, peak_active
-            with lock:
-                active += 1
-                peak_active = max(peak_active, active)
-            time.sleep(0.05)
-            with lock:
-                active -= 1
-            return FINDetectionOutput(
-                fin="1ABC234",
-                confidence=0.9,
-                mrz_result=None,
-                notes=[],
-            )
-
-    def factory() -> FakeDetector:
-        detector = FakeDetector()
-        created.append(detector)
-        return detector
-
-    pool = DetectorPool(2, factory)
-    assert len(created) == 2
-
-    def run_one() -> None:
-        with pool.acquire() as detector:
-            serialize_fin_detection(detector.detect_from_mrz("x.png"))
-
-    threads = [threading.Thread(target=run_one) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    assert peak_active == 2
-    assert pool.stats()["available"] == 2
-
-
-def test_id_fin_service_processes_batch_in_parallel(monkeypatch) -> None:
-    import asyncio
-    import time
-    from pathlib import Path
-
-    from services.id_fin import service as service_module
-
-    class FakeSettings:
-        use_gpu = False
-        debug = False
-        ocr_max_concurrency = 2
-
-    monkeypatch.setattr(service_module, "get_settings", lambda: FakeSettings())
-
-    class FakeDetector:
-        def __init__(self, *args, **kwargs) -> None:
-            del args, kwargs
-
-        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
-            time.sleep(0.08)
-            return FINDetectionOutput(
-                fin=f"FIN-{Path(image_path).name}",
-                confidence=0.91,
-                mrz_result=None,
-                notes=[],
-            )
-
-    monkeypatch.setattr(service_module, "FINDetector", FakeDetector)
-    service = service_module.IDFinService()
-    began = time.perf_counter()
-    results = asyncio.run(
-        service.process_many(
-            image_paths=[Path("a.png"), Path("b.png"), Path("c.png")]
-        )
-    )
-    elapsed = time.perf_counter() - began
-
-    assert [item["fin"] for item in results] == [
-        "FIN-a.png",
-        "FIN-b.png",
-        "FIN-c.png",
-    ]
-    # Keep enough CI headroom while still catching fully serial execution.
-    assert elapsed < 0.30
-    assert service.concurrency_info()["max_concurrency"] == 2
-

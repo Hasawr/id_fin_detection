@@ -1,8 +1,11 @@
 import base64
+from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from api.main import app
 from services.id_fin.detector import OCRProcessingError
@@ -15,6 +18,16 @@ VALID_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
     "+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
+TEST_API_KEY = "test-api-key-that-is-at-least-32-characters"
+
+
+def make_test_image(image_format: str) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), color="white").save(
+        buffer,
+        format=image_format,
+    )
+    return buffer.getvalue()
 
 
 class FakeIDFinService:
@@ -29,6 +42,7 @@ class FakeIDFinService:
             "mrz_details": {
                 "card_type": "new_card",
                 "card_serial_number": "AA1234567",
+                "line1": "SECRET-MRZ-LINE",
             }
             if image_path
             else None,
@@ -45,14 +59,6 @@ class FakeIDFinService:
             for image_path in image_paths
         ]
 
-    def concurrency_info(self) -> dict[str, object]:
-        return {
-            "max_concurrency": 2,
-            "workers": 2,
-            "available_workers": 2,
-        }
-
-
 @pytest.fixture()
 def client(tmp_path: Path):
     audit_db = tmp_path / "audit.db"
@@ -62,13 +68,12 @@ def client(tmp_path: Path):
 
     def override_settings() -> Settings:
         return Settings(
-            api_keys=("test-key",),
+            api_keys=(TEST_API_KEY,),
             use_gpu=False,
-            debug=False,
+            save_ocr_debug_images=False,
             max_upload_bytes=1024 * 1024,
             max_image_pixels=1_000_000,
             max_batch_files=2,
-            ocr_max_concurrency=2,
             audit_db_path=audit_db,
             audit_payload_dir=payload_dir,
         )
@@ -91,8 +96,6 @@ def test_health_does_not_require_authentication(client) -> None:
     assert response.json() == {
         "status": "ok",
         "services": ["id-fin"],
-        "ocr_max_concurrency": 2,
-        "ocr_available_workers": None,
     }
 
 
@@ -100,7 +103,7 @@ def test_health_does_not_initialize_ocr_service(client) -> None:
     test_client, _ = client
 
     def fail_if_initialized():
-        raise AssertionError("Health must not initialize OCR workers.")
+        raise AssertionError("Health must not initialize the OCR service.")
 
     app.dependency_overrides[get_id_fin_service] = fail_if_initialized
     response = test_client.get("/health")
@@ -129,7 +132,7 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
     test_client, store = client
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files={"mrz": ("id.png", VALID_PNG, "image/png")},
     )
     assert response.status_code == 200
@@ -147,24 +150,26 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
     events = store.recent_events(hours=None)
     assert len(events) == 1
     event = events[0]
-    assert event.result_summary == "FIN 7ABC123 · Serial AA1234567 (0.99)"
-    assert event.response_body["data"]["fin"] == "7ABC123"
+    assert event.result_summary == (
+        "FIN [REDACTED] · Serial [REDACTED] (0.99)"
+    )
+    assert event.response_body["data"]["fin"] == "[REDACTED]"
     assert (
         event.response_body["data"]["mrz_details"]["card_serial_number"]
-        == "AA1234567"
+        == "[REDACTED]"
     )
-    assert len(event.request_files) == 1
-    assert event.request_files[0]["file_name"] == "id.png"
-    saved = store.payload_dir.parent / event.request_files[0]["saved_path"]
-    assert saved.exists()
-    assert saved.read_bytes() == VALID_PNG
+    assert event.request_files == []
+    assert event.payload_dir is None
+    assert "7ABC123" not in str(event.response_body)
+    assert "AA1234567" not in str(event.response_body)
+    assert "SECRET-MRZ-LINE" not in str(event.response_body)
 
 
 def test_id_fin_batch_accepts_multiple_uploads(client) -> None:
     test_client, store = client
     response = test_client.post(
         "/v1/id-fin/batch",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files=[
             ("mrz", ("first.png", VALID_PNG, "image/png")),
             ("mrz", ("second.png", VALID_PNG, "image/png")),
@@ -272,7 +277,7 @@ def test_id_fin_batch_enforces_file_limit(client) -> None:
     test_client, _ = client
     response = test_client.post(
         "/v1/id-fin/batch",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files=[
             ("mrz", ("first.png", VALID_PNG, "image/png")),
             ("mrz", ("second.png", VALID_PNG, "image/png")),
@@ -286,7 +291,7 @@ def test_id_fin_requires_an_image(client) -> None:
     test_client, _ = client
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
     )
     assert response.status_code == 422
 
@@ -319,17 +324,56 @@ def test_id_fin_rejects_unsupported_image_type(client) -> None:
     test_client, _ = client
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files={"mrz": ("id.gif", b"GIF89a", "image/gif")},
     )
     assert response.status_code == 415
+
+
+def test_id_fin_rejects_webp_even_with_image_content_type(client) -> None:
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("id.webp", b"RIFFxxxxWEBP", "image/webp")},
+    )
+    assert response.status_code == 415
+
+
+@pytest.mark.parametrize(
+    ("file_name", "content_type", "image_format"),
+    [
+        ("id.png", "image/png", "PNG"),
+        ("id.jpg", "image/jpeg", "JPEG"),
+        ("id.bmp", "image/bmp", "BMP"),
+    ],
+)
+def test_id_fin_accepts_supported_image_formats(
+    client,
+    file_name: str,
+    content_type: str,
+    image_format: str,
+) -> None:
+    test_client, _ = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={
+            "mrz": (
+                file_name,
+                make_test_image(image_format),
+                content_type,
+            )
+        },
+    )
+    assert response.status_code == 200
 
 
 def test_id_fin_rejects_empty_image(client) -> None:
     test_client, _ = client
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files={"mrz": ("id.png", b"", "image/png")},
     )
     assert response.status_code == 400
@@ -346,7 +390,7 @@ def test_id_fin_reports_ocr_engine_failure(client) -> None:
     app.dependency_overrides[get_id_fin_service] = FailingIDFinService
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files={"mrz": ("id.png", VALID_PNG, "image/png")},
     )
 
@@ -354,21 +398,93 @@ def test_id_fin_reports_ocr_engine_failure(client) -> None:
     assert response.json()["error"]["code"] == "ocr_processing_failed"
 
 
+def test_id_fin_batch_reports_ocr_engine_failure(client) -> None:
+    test_client, _ = client
+
+    class FailingIDFinService:
+        async def process_many(
+            self,
+            *,
+            image_paths: list[Path],
+        ) -> list[dict[str, object]]:
+            del image_paths
+            raise OCRProcessingError("engine failed")
+
+    app.dependency_overrides[get_id_fin_service] = FailingIDFinService
+    response = test_client.post(
+        "/v1/id-fin/batch",
+        headers={"X-API-Key": TEST_API_KEY},
+        files=[("mrz", ("id.png", VALID_PNG, "image/png"))],
+    )
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "ocr_processing_failed"
+
+
+def test_id_fin_rejects_oversized_upload(client) -> None:
+    test_client, _ = client
+    limited_settings = replace(app.state.settings, max_upload_bytes=1)
+    app.dependency_overrides[get_settings] = lambda: limited_settings
+
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+
+    assert response.status_code == 413
+
+
+def test_id_fin_rejects_oversized_image_dimensions(
+    client,
+) -> None:
+    test_client, _ = client
+    limited_settings = replace(app.state.settings, max_image_pixels=1)
+    app.dependency_overrides[get_settings] = lambda: limited_settings
+
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={
+            "mrz": (
+                "id.png",
+                make_test_image("PNG"),
+                "image/png",
+            )
+        },
+    )
+
+    assert response.status_code == 413
+
+
 def test_id_fin_rejects_invalid_image_content(client) -> None:
     test_client, _ = client
     response = test_client.post(
         "/v1/id-fin",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
         files={"mrz": ("id.png", b"not-an-image", "image/png")},
     )
     assert response.status_code == 422
+
+
+def test_id_fin_reports_unconfigured_authentication(client) -> None:
+    test_client, _ = client
+    unconfigured_settings = replace(app.state.settings, api_keys=())
+    app.dependency_overrides[get_settings] = lambda: unconfigured_settings
+
+    response = test_client.post(
+        "/v1/id-fin",
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+
+    assert response.status_code == 503
 
 
 def test_passport_is_an_authenticated_stub(client) -> None:
     test_client, store = client
     response = test_client.post(
         "/v1/passport",
-        headers={"X-API-Key": "test-key"},
+        headers={"X-API-Key": TEST_API_KEY},
     )
     assert response.status_code == 501
     assert response.json()["error"]["code"] == "not_implemented"
@@ -378,3 +494,64 @@ def test_passport_is_an_authenticated_stub(client) -> None:
     assert events[0].service == "passport"
     assert events[0].success is False
     assert events[0].error_code == "not_implemented"
+
+
+def test_batch_enforces_aggregate_byte_limit(client) -> None:
+    test_client, _ = client
+    limited_settings = replace(
+        app.state.settings,
+        max_batch_bytes=len(VALID_PNG),
+    )
+    app.state.settings = limited_settings
+    app.dependency_overrides[get_settings] = lambda: limited_settings
+    response = test_client.post(
+        "/v1/id-fin/batch",
+        headers={"X-API-Key": TEST_API_KEY},
+        files=[
+            ("mrz", ("first.png", VALID_PNG, "image/png")),
+            ("mrz", ("second.png", VALID_PNG, "image/png")),
+        ],
+    )
+    assert response.status_code == 413
+
+
+def test_raw_payload_retention_requires_opt_in(client) -> None:
+    test_client, store = client
+    app.state.settings = replace(
+        app.state.settings,
+        audit_store_payloads=True,
+    )
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+    assert response.status_code == 200
+
+    event = store.recent_events(hours=None)[0]
+    assert len(event.request_files) == 1
+    saved = store.payload_dir.parent / event.request_files[0]["saved_path"]
+    assert saved.read_bytes() == VALID_PNG
+
+
+def test_rejected_payload_is_never_retained_when_opted_in(client) -> None:
+    test_client, store = client
+    app.state.settings = replace(
+        app.state.settings,
+        audit_store_payloads=True,
+    )
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "invalid"},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+    assert response.status_code == 401
+    event = store.recent_events(hours=None)[0]
+    assert event.request_files == []
+    assert event.payload_dir is None
+
+
+def test_api_docs_are_always_visible(client) -> None:
+    test_client, _ = client
+    assert test_client.get("/docs").status_code == 200
+    assert test_client.get("/openapi.json").status_code == 200
