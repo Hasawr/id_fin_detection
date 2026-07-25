@@ -25,6 +25,7 @@ from .validator import (
     compute_mrz_check_digit,
     correct_ocr_digits,
     is_valid_fin,
+    resolve_fin_o0_ambiguity,
     is_valid_new_card_serial,
     is_valid_old_card_serial,
 )
@@ -417,18 +418,14 @@ class MRZExtractor:
         canonical_fin = normalized[
             fin_start : fin_start + TD2_FIN.length
         ]
-        composite_check = correct_ocr_digits(
-            TD2_COMPOSITE_CHECK.read(normalized)
-        )
-        composite_data = (
-            normalized[0:10]
-            + normalized[13:20]
-            + normalized[21:35]
-        )
-        composite_checksum_valid = (
-            composite_check.isdigit()
-            and compute_mrz_check_digit(composite_data)
-            == int(composite_check)
+        if fin is not None and fin_start >= 0:
+            normalized = (
+                normalized[:fin_start]
+                + fin
+                + normalized[fin_start + TD2_FIN.length :]
+            )
+        composite_checksum_valid = cls._td2_composite_checksum_valid(
+            normalized
         )
         return {
             "fin": fin,
@@ -440,12 +437,50 @@ class MRZExtractor:
         }
 
     @classmethod
+    def _td2_composite_checksum_valid(cls, line2: str) -> bool:
+        normalized = cls._normalize_length(line2, TD2_LINE_LENGTH)
+        composite_check = correct_ocr_digits(
+            TD2_COMPOSITE_CHECK.read(normalized)
+        )
+        composite_data = (
+            normalized[0:10]
+            + normalized[13:20]
+            + normalized[21:35]
+        )
+        return (
+            composite_check.isdigit()
+            and compute_mrz_check_digit(composite_data)
+            == int(composite_check)
+        )
+
+    @classmethod
+    def _td2_composite_valid_with_fin(
+        cls,
+        line2: str,
+        fin_start: int,
+        fin: str,
+    ) -> bool:
+        normalized = cls._normalize_length(line2, TD2_LINE_LENGTH)
+        if fin_start < 0 or fin_start + TD2_FIN.length > len(normalized):
+            return False
+        spliced = (
+            normalized[:fin_start]
+            + fin
+            + normalized[fin_start + TD2_FIN.length :]
+        )
+        return cls._td2_composite_checksum_valid(spliced)
+
+    @classmethod
     def _recover_td2_fin(cls, line2: str, expected_start: int) -> str | None:
         """Prefer the fixed FIN window, then nearby offsets with a check digit."""
+        windows: list[tuple[int, str]] = []
         if expected_start >= 0 and expected_start + TD2_FIN.length <= len(line2):
-            primary = line2[expected_start : expected_start + TD2_FIN.length]
-            if is_valid_fin(primary):
-                return primary
+            windows.append(
+                (
+                    expected_start,
+                    line2[expected_start : expected_start + TD2_FIN.length],
+                )
+            )
 
         # Offset recovery only when a trailing check digit is present. This
         # avoids accepting truncated tails like "71SHORT" as a FIN.
@@ -454,8 +489,18 @@ class MRZExtractor:
             if start < 0 or start + TD2_FIN.length + 1 > len(line2):
                 continue
             value = line2[start : start + TD2_FIN.length]
-            if is_valid_fin(value) and line2[start + TD2_FIN.length].isdigit():
-                return value
+            if line2[start + TD2_FIN.length].isdigit():
+                windows.append((start, value))
+
+        for start, window in windows:
+            resolved = resolve_fin_o0_ambiguity(
+                window,
+                checksum_ok=lambda fin, fin_start=start: (
+                    cls._td2_composite_valid_with_fin(line2, fin_start, fin)
+                ),
+            )
+            if resolved is not None:
+                return resolved
         return None
 
     @staticmethod

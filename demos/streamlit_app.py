@@ -24,15 +24,49 @@ from shared.config import get_settings
 st.set_page_config(page_title="OCR Demo", layout="wide")
 
 # Hide the default multipage sidebar; navigation uses the top header tabs.
+# Keep ID previews as fixed-size thumbnails (vh/% sizing breaks on browser zoom).
 st.markdown(
     """
     <style>
       [data-testid="stSidebar"] { display: none; }
       [data-testid="stSidebarCollapsedControl"] { display: none; }
+      .block-container { padding-top: 1.25rem; padding-bottom: 2rem; }
+      h1, h2, h3 { margin-top: 0.2rem; margin-bottom: 0.35rem; }
+      div[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stImage"] {
+        max-width: 240px;
+      }
+      div[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stImage"] img {
+        width: 240px !important;
+        max-width: 240px !important;
+        height: auto !important;
+        max-height: 300px !important;
+        object-fit: contain;
+      }
+      .demo-status {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.25rem 0.65rem;
+        border-radius: 999px;
+        font-size: 0.85rem;
+        font-weight: 600;
+        line-height: 1.2;
+        white-space: nowrap;
+      }
+      .demo-status-ok {
+        background: #e8f6ee;
+        color: #146c2e;
+      }
+      .demo-status-bad {
+        background: #fff4e5;
+        color: #9a5b00;
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+RESULT_IMAGE_WIDTH_PX = 240
 
 # Increment when cached detector/result objects become incompatible.
 RESULT_SCHEMA_VERSION = 13
@@ -85,31 +119,38 @@ def build_batch_stats(
 
 
 def render_id_fin_demo() -> None:
-    st.title("Azerbaijani ID FIN OCR")
-    st.caption(
-        "Internal demo for the ID FIN service. The production interface is FastAPI."
-    )
-
     if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
         clear_detection_results()
         st.session_state["result_schema_version"] = RESULT_SCHEMA_VERSION
 
     settings = get_settings()
-
-    st.subheader("Runtime")
     has_api_key = bool(settings.api_keys)
     is_backend_ready = get_backend_health(settings.ocr_api_base_url)
-    if is_backend_ready:
-        st.success("FastAPI OCR backend is ready.")
-    else:
-        st.warning(
-            "FastAPI OCR backend is unavailable. Start run.bat or the API."
+
+    title_col, status_col = st.columns([3.2, 1.3], gap="small")
+    with title_col:
+        st.markdown("### Azerbaijani ID FIN OCR")
+        st.caption(
+            "Internal demo · production API is FastAPI · "
+            f"`{settings.ocr_api_base_url}` · "
+            f"sequential · max batch={settings.max_batch_files}"
         )
-    st.caption(
-        f"Backend: {settings.ocr_api_base_url} · "
-        f"one OCR engine processes images sequentially · "
-        f"max batch={settings.max_batch_files}"
-    )
+    with status_col:
+        if is_backend_ready:
+            st.markdown(
+                '<div style="text-align:right;padding-top:0.35rem">'
+                '<span class="demo-status demo-status-ok">Backend ready</span>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="text-align:right;padding-top:0.35rem">'
+                '<span class="demo-status demo-status-bad">Backend offline</span>'
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            st.caption("Start `run.bat` or the API, then refresh.")
     if not has_api_key:
         st.error("API_KEYS is not configured; Streamlit cannot call the API.")
 
@@ -326,27 +367,51 @@ def render_id_fin_demo() -> None:
         st.info("No results match the selected filters.")
         return
 
-    total_pages = (
-        len(filtered_results) + RESULTS_PER_PAGE - 1
-    ) // RESULTS_PER_PAGE
-    available_pages = list(range(1, total_pages + 1))
-    if st.session_state.get("result_page") not in available_pages:
-        st.session_state["result_page"] = 1
-    selected_page = st.selectbox(
-        "Result page",
-        options=available_pages,
-        key="result_page",
-        format_func=lambda page: f"Page {page} of {total_pages}",
+    total_pages = max(
+        1,
+        (len(filtered_results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE,
     )
+    selected_page = int(st.session_state.get("result_page", 1))
+    selected_page = max(1, min(selected_page, total_pages))
+    st.session_state["result_page"] = selected_page
+
     page_start = (selected_page - 1) * RESULTS_PER_PAGE
-    page_results = filtered_results[
-        page_start : page_start + RESULTS_PER_PAGE
-    ]
+    page_end = min(page_start + RESULTS_PER_PAGE, len(filtered_results))
+    page_results = filtered_results[page_start:page_end]
+
+    nav_left, nav_center, nav_right = st.columns([1, 2.2, 1])
+    with nav_left:
+        if st.button(
+            "← Previous",
+            disabled=selected_page <= 1,
+            use_container_width=True,
+            key="result_page_prev",
+        ):
+            st.session_state["result_page"] = selected_page - 1
+            st.rerun()
+    with nav_center:
+        st.markdown(
+            f"<div style='text-align:center;padding-top:0.45rem;opacity:0.7;"
+            f"font-size:0.9rem'>"
+            f"Page {selected_page} of {total_pages}"
+            f" · {page_start + 1}–{page_end} of {len(filtered_results)}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    with nav_right:
+        if st.button(
+            "Next →",
+            disabled=selected_page >= total_pages,
+            use_container_width=True,
+            key="result_page_next",
+        ):
+            st.session_state["result_page"] = selected_page + 1
+            st.rerun()
 
     for original_index, file_name, result, elapsed in page_results:
         with st.container(border=True):
             st.subheader(file_name)
-            image_column, result_column = st.columns([1, 1.2])
+            image_column, result_column = st.columns([1, 4], gap="medium")
             with image_column:
                 if (
                     original_index < len(mrz_files)
@@ -354,11 +419,11 @@ def render_id_fin_demo() -> None:
                 ):
                     st.image(
                         mrz_files[original_index],
-                        caption="Processed MRZ-side image",
-                        use_container_width=True,
+                        caption="Preview",
+                        width=RESULT_IMAGE_WIDTH_PX,
                     )
                 else:
-                    st.info("Re-upload this image to display its preview.")
+                    st.caption("Re-upload to show preview.")
 
             with result_column:
                 if has_processing_error(result):
@@ -373,37 +438,42 @@ def render_id_fin_demo() -> None:
                     )
                     st.error(failure_message)
 
-                st.metric("FIN", result.fin or "Not found")
+                fin_col, serial_col = st.columns(2)
+                with fin_col:
+                    st.metric("FIN", result.fin or "Not found")
+                mrz_result = result.mrz_details
+                with serial_col:
+                    serial_value = (
+                        mrz_result.card_serial_number
+                        if mrz_result is not None
+                        and mrz_result.card_serial_number
+                        else "—"
+                    )
+                    st.metric("Card serial number", serial_value)
+
                 st.caption(
                     f"Confidence: {result.confidence:.2%} · "
                     f"This image: {elapsed:.2f}s"
                 )
 
-                mrz_result = result.mrz_details
                 if mrz_result is not None:
                     if mrz_result.card_type == "new_card":
-                        st.info("Card type: New card (3-line MRZ)")
+                        card_label = "New card (3-line MRZ)"
                     elif mrz_result.card_type == "older_card":
-                        st.info("Card type: Older card (2-line MRZ)")
+                        card_label = "Older card (2-line MRZ)"
                     else:
-                        st.warning("Card type: Unknown")
+                        card_label = "Unknown"
 
-                    card_serial_number = mrz_result.card_serial_number
-                    if card_serial_number:
-                        st.metric(
-                            "Card serial number",
-                            card_serial_number,
-                        )
+                    checksum_label = (
+                        "checksum valid"
+                        if mrz_result.checksum_valid
+                        else "checksum invalid/unavailable"
+                    )
+                    st.caption(
+                        f"**{card_label}** · `{mrz_result.method}` · "
+                        f"{checksum_label}"
+                    )
 
-                    st.write(f"**Detection method:** `{mrz_result.method}`")
-                    if mrz_result.checksum_valid:
-                        st.success("Document-number checksum is valid")
-                    else:
-                        st.warning(
-                            "Document-number checksum is invalid or unavailable"
-                        )
-
-                    st.write("**Reconstructed MRZ lines**")
                     st.code(
                         "\n".join(
                             [

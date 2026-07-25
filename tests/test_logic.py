@@ -14,6 +14,8 @@ from services.id_fin.validator import (
     is_valid_fin,
     is_valid_new_card_serial,
     is_valid_old_card_serial,
+    iter_o0_variants,
+    resolve_fin_o0_ambiguity,
 )
 from services.id_fin.mrz_extractor import MRZExtractor
 
@@ -60,6 +62,36 @@ def test_ocr_digit_confusion_and_serial_validation() -> None:
     assert not is_valid_new_card_serial("19205792")
 
 
+def test_fin_o0_variants_and_checksum_resolution() -> None:
+    assert iter_o0_variants("2BDLLON") == [
+        "2BDLLON",
+        "2BDLL0N",
+    ]
+    assert resolve_fin_o0_ambiguity("2BDLL0N") == "2BDLL0N"
+    assert (
+        resolve_fin_o0_ambiguity(
+            "2BDLL0N",
+            checksum_ok=lambda fin: fin == "2BDLLON",
+        )
+        == "2BDLLON"
+    )
+    assert (
+        resolve_fin_o0_ambiguity(
+            "2BDLLON",
+            checksum_ok=lambda fin: fin == "2BDLL0N",
+        )
+        == "2BDLL0N"
+    )
+    # Keep OCR when the composite check does not uniquely force a flip.
+    assert (
+        resolve_fin_o0_ambiguity(
+            "2BDLLON",
+            checksum_ok=lambda _fin: False,
+        )
+        == "2BDLLON"
+    )
+
+
 def test_td1_line2_checksums_strengthen_candidate_score() -> None:
     valid = "9601226M3006162AZE<<<<<<<<<<<5"
     invalid = "9601220M3006160AZE<<<<<<<<<<<5"
@@ -70,7 +102,7 @@ def test_td1_line2_checksums_strengthen_candidate_score() -> None:
 
 def test_fixed_mrz_positions_for_fin_and_serial() -> None:
     new_line1 = "IAAZEAA203982795H0H4NX<<<<<<<<"
-    old_line2 = "19205792<7AZE8210276M32102712BDLLON5"
+    old_line2 = "19205792<7AZE8210276M32102712BDLLON9"
 
     assert TD1_SERIAL.read(new_line1) == "AA2039827"
     assert TD1_FIN.read(new_line1) == "5H0H4NX"
@@ -143,7 +175,7 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
         extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
-            ("19205792<7AZE8210276M32102712BDLLON5", 0.99),
+            ("19205792<7AZE8210276M32102712BDLLON9", 0.99),
         ),
         is_cropped=False,
     )
@@ -177,6 +209,23 @@ def test_td1_checksum_corrects_ocr_digit_confusion() -> None:
 
     assert result.card_serial_number == "AA2039827"
     assert result.checksum_valid is True
+
+
+def test_td2_composite_checksum_fixes_fin_o0_confusion() -> None:
+    extractor = MRZExtractor.__new__(MRZExtractor)
+    # Letter O is correct (composite check digit 9); OCR read digit 0.
+    mistook_o_as_zero = "19205792<7AZE8210276M32102712BDLL0N9"
+    # Digit 0 is correct (composite check digit 5); OCR read letter O.
+    mistook_zero_as_o = "19205792<7AZE8210276M32102712BDLLON5"
+
+    assert extractor._extract_td2_fields(mistook_o_as_zero)["fin"] == "2BDLLON"
+    assert extractor._extract_td2_fields(mistook_zero_as_o)["fin"] == "2BDLL0N"
+    assert extractor._extract_td2_fields(mistook_o_as_zero)[
+        "composite_checksum_valid"
+    ]
+    assert extractor._extract_td2_fields(mistook_zero_as_o)[
+        "composite_checksum_valid"
+    ]
 
 
 def test_td2_composite_checksum_affects_candidate_score() -> None:
@@ -249,7 +298,7 @@ def test_structural_validation_accepts_td1_and_td2() -> None:
         extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
-            ("19205792<7AZE8210276M32102712BDLLON5", 0.99),
+            ("19205792<7AZE8210276M32102712BDLLON9", 0.99),
         ),
         is_cropped=True,
     )
@@ -365,7 +414,7 @@ def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
     merged_lines = [
         ("14<05<1978<<<<<<<<<<<<<<<<<<<<", 0.97),
         ("GOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.96),
-        ("19205792<7AZE8210276M32102712BDLLON5", 0.98),
+        ("19205792<7AZE8210276M32102712BDLLON9", 0.98),
     ]
 
     pair = extractor._find_td2_pair(merged_lines)
@@ -384,7 +433,7 @@ def test_older_card_fin_recovers_when_aze_alignment_shifts() -> None:
         extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
-            ("19205792<7XAZE8210276M32102712BDLLON5", 0.99),
+            ("19205792<7XAZE8210276M32102712BDLLON9", 0.99),
         ),
         is_cropped=False,
     )
@@ -400,7 +449,7 @@ def test_older_card_tolerates_digit_confusion_in_birth_date() -> None:
         extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
-            ("19205792<7AZE82IO276M32102712BDLLON5", 0.99),
+            ("19205792<7AZE82IO276M32102712BDLLON9", 0.99),
         ),
         is_cropped=False,
     )
@@ -416,7 +465,7 @@ def test_older_card_serial_corrects_ocr_digit_confusion() -> None:
         extractor,
         (
             ("I<AZEGOJAYEV<<AYKHAN<<<<<<<<<<<<<<<<", 0.99),
-            ("192O5792<7AZE8210276M32102712BDLLON5", 0.99),
+            ("192O5792<7AZE8210276M32102712BDLLON9", 0.99),
         ),
         is_cropped=False,
     )
@@ -430,7 +479,7 @@ def test_strong_td1_candidate_beats_weak_headerless_td2_candidate() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
     merged_lines = [
         ("NOISY<<NAME<<<<<<<<<<<<<<<<<<<<", 0.70),
-        ("19205792<0AZE8210276M32102712BDLLON5", 0.70),
+        ("19205792<0AZE8210276M32102712BDLLON9", 0.70),
         ("IAAZEAA12345670AZE1ABC234<<<<<", 0.97),
         ("9001011M3001019AZE<<<<<<<<<<<0", 0.97),
         ("TEST<<PERSON<<<<<<<<<<<<<<<<<<", 0.97),
