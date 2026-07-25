@@ -46,6 +46,8 @@ def configure_nvidia_dll_directories() -> None:
 
 
 class FINDetector:
+    HIGH_CONFIDENCE_ACCEPT = 0.90
+    RECTIFIED_FAIL_FAST_ATTEMPTS = 3
     ORIGINAL_IMAGE_RECOVERY_ATTEMPTS = frozenset(
         {"mrz_strip", "mrz_roi", "full_image"}
     )
@@ -115,6 +117,8 @@ class FINDetector:
             attempts = self._build_attempts(rectified)
             attempted_results = []
             valid_results = []
+            roi_applied = rectified is not image
+            failed_rectified_attempts = 0
             for attempt in attempts:
                 fin_counts = Counter(
                     result.fin for result in valid_results if result.fin
@@ -154,21 +158,27 @@ class FINDetector:
                     attempted_result
                 ):
                     valid_results.append(attempted_result)
-                    agreement = sum(
-                        result.fin == attempted_result.fin
-                        for result in valid_results
-                    )
-                    distinct_fins = {
-                        result.fin for result in valid_results if result.fin
-                    }
-                    if agreement >= 2 and len(distinct_fins) == 1:
+                    if self._should_stop_after_valid_result(
+                        attempted_result,
+                        valid_results,
+                        notes,
+                        attempt_name=attempt.name,
+                    ):
+                        break
+                elif roi_applied and not valid_results:
+                    failed_rectified_attempts += 1
+                    if (
+                        failed_rectified_attempts
+                        >= self.RECTIFIED_FAIL_FAST_ATTEMPTS
+                    ):
                         notes.append(
-                            "Strong FIN consensus reached after "
-                            f"{attempt.name}."
+                            "Rectified crop produced no MRZ after "
+                            f"{self.RECTIFIED_FAIL_FAST_ATTEMPTS} attempts; "
+                            "trying original image."
                         )
                         break
 
-            if not valid_results and rectified is not image:
+            if not valid_results and roi_applied:
                 for attempt in self._build_attempts(image):
                     if (
                         attempt.name
@@ -195,12 +205,12 @@ class FINDetector:
                     ):
                         continue
                     valid_results.append(attempted_result)
-                    fin_counts = Counter(
-                        result.fin
-                        for result in valid_results
-                        if result.fin
-                    )
-                    if max(fin_counts.values(), default=0) >= 2:
+                    if self._should_stop_after_valid_result(
+                        attempted_result,
+                        valid_results,
+                        notes,
+                        attempt_name=attempt_name,
+                    ):
                         break
 
             if not valid_results:
@@ -277,6 +287,43 @@ class FINDetector:
             raise OCRProcessingError(
                 f"Failed to process MRZ image {image_path.name}."
             ) from exc
+
+    @classmethod
+    def _is_high_confidence_accept(cls, result) -> bool:
+        return (
+            bool(result.checksum_valid)
+            and bool(result.fin_is_canonical)
+            and float(result.confidence) >= cls.HIGH_CONFIDENCE_ACCEPT
+        )
+
+    @classmethod
+    def _should_stop_after_valid_result(
+        cls,
+        attempted_result,
+        valid_results: list,
+        notes: list[str],
+        *,
+        attempt_name: str,
+    ) -> bool:
+        agreement = sum(
+            result.fin == attempted_result.fin for result in valid_results
+        )
+        distinct_fins = {
+            result.fin for result in valid_results if result.fin
+        }
+        if len(distinct_fins) > 1:
+            return False
+        if cls._is_high_confidence_accept(attempted_result):
+            notes.append(
+                f"High-confidence FIN accepted after {attempt_name}."
+            )
+            return True
+        if agreement >= 2:
+            notes.append(
+                f"Strong FIN consensus reached after {attempt_name}."
+            )
+            return True
+        return False
 
     @staticmethod
     def _result_rank(result, fin_counts: Counter) -> tuple:

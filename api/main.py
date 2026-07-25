@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -40,7 +41,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         if get_id_fin_service.cache_info().currsize:
-            get_id_fin_service().close()
+            service = get_id_fin_service()
+            await asyncio.to_thread(service.close)
             get_id_fin_service.cache_clear()
 
 

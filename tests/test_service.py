@@ -1,11 +1,12 @@
 import asyncio
 from pathlib import Path
+from threading import Event
 
 import pytest
 
 from services.id_fin import FINDetectionOutput, MRZResult
 from services.id_fin.detector import OCRProcessingError
-from services.id_fin.service import serialize_fin_detection
+from services.id_fin.service import ServiceClosedError, serialize_fin_detection
 
 
 def test_service_serializes_public_card_details_only() -> None:
@@ -115,3 +116,68 @@ def test_sequential_batch_stops_after_processing_error(monkeypatch) -> None:
 
     assert completed == []
     service.close()
+
+
+def test_service_close_is_idempotent_and_rejects_new_work(monkeypatch) -> None:
+    from services.id_fin import service as service_module
+
+    class FakeSettings:
+        use_gpu = False
+        save_ocr_debug_images = False
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            return FINDetectionOutput(fin=image_path.stem, confidence=0.9)
+
+    monkeypatch.setattr(service_module, "FINDetector", FakeDetector)
+    service = service_module.IDFinService(settings=FakeSettings())
+
+    service.close()
+    service.close()
+
+    with pytest.raises(ServiceClosedError, match="closed"):
+        asyncio.run(service.process_detection(image_path=Path("late.png")))
+    with pytest.raises(ServiceClosedError, match="closed"):
+        asyncio.run(service.process_many(image_paths=[]))
+
+
+def test_service_close_drains_in_flight_work(monkeypatch) -> None:
+    from services.id_fin import service as service_module
+
+    started = Event()
+    release = Event()
+
+    class FakeSettings:
+        use_gpu = False
+        save_ocr_debug_images = False
+
+    class BlockingDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            started.set()
+            release.wait(timeout=2)
+            return FINDetectionOutput(fin=image_path.stem, confidence=0.9)
+
+    monkeypatch.setattr(service_module, "FINDetector", BlockingDetector)
+    service = service_module.IDFinService(settings=FakeSettings())
+
+    async def run_scenario() -> FINDetectionOutput:
+        processing = asyncio.create_task(
+            service.process_detection(image_path=Path("active.png"))
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        closing = asyncio.create_task(asyncio.to_thread(service.close))
+        await asyncio.sleep(0.02)
+        assert not closing.done()
+        release.set()
+        result = await processing
+        await closing
+        return result
+
+    result = asyncio.run(run_scenario())
+    assert result.fin == "active"

@@ -66,11 +66,14 @@ double-click `run.bat` or run:
 
 The script works from any current directory, uses `.venv` when present,
 creates `.env` with a random API key when missing, and installs missing
-dependencies. It binds both applications to loopback. Streamlit has no remote
+dependencies. It starts FastAPI first, waits for `/health`, and only then
+starts Streamlit. Both applications bind to loopback. Streamlit has no remote
 login and must never be exposed directly or reverse-proxied publicly.
 
 PaddleOCR downloads its model files when the ID FIN service is used for the
-first time. The detector is then reused for later requests.
+first time. The detector is then reused for later requests. FastAPI is the
+only process that owns PaddleOCR and GPU memory; Streamlit is a lightweight
+HTTP client and sends each selected image to FastAPI one at a time.
 
 ## Call the ID FIN endpoint
 
@@ -127,6 +130,7 @@ same device.
 Recommended `.env` values:
 
 ```dotenv
+OCR_API_BASE_URL=http://127.0.0.1:8000
 USE_GPU=true
 SAVE_OCR_DEBUG_IMAGES=false
 MAX_BATCH_FILES=100
@@ -156,6 +160,7 @@ services/
 shared/                 Configuration and secure upload handling
 demos/
   streamlit_app.py      Internal Streamlit demo (top-tab navigation)
+  api_client.py         Resilient local FastAPI client used by Streamlit
   audit_dashboard.py    Integration Audit tab
   cli.py                Local command-line interface
 
@@ -166,7 +171,8 @@ benchmarks/             PII-safe local accuracy and GPU performance harness
 
 The HTTP route handles transport and validation. Each package under
 `services/` owns its OCR implementation. `IDFinService` keeps one PaddleOCR
-engine and runs inference on a single background executor thread.
+engine and runs inference on a single background executor thread. Shutdown
+rejects new requests and waits for already-submitted OCR work to finish.
 
 ## Add another OCR service
 
@@ -186,6 +192,13 @@ streamlit run demos\streamlit_app.py --server.address 127.0.0.1
 In Streamlit, use the top **Integration Audit** tab to inspect third-party
 API traffic recorded while the FastAPI backend is running. Keep Streamlit on
 `127.0.0.1`; its audit data is operationally sensitive.
+
+The ID FIN page checks backend health before enabling processing. If you run
+Streamlit separately, start FastAPI first and set `OCR_API_BASE_URL` when it
+is not using the default loopback URL. Streamlit uses the first key in
+`API_KEYS` only for this loopback demo. Restart the FastAPI process after OCR
+code, model, GPU, or runtime configuration changes; restarting only
+Streamlit does not reload the OCR engine.
 
 ## Tests
 

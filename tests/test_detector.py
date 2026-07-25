@@ -313,6 +313,7 @@ def test_detector_stops_before_recovery_after_strong_consensus() -> None:
                 card_type="new_card",
                 card_serial_number=None,
                 quality_score=100,
+                fin_is_canonical=False,
             )
 
         @staticmethod
@@ -333,6 +334,141 @@ def test_detector_stops_before_recovery_after_strong_consensus() -> None:
 
     assert result.fin == "1ABC234"
     assert attempted == ["mrz_strip", "mrz_roi"]
+    assert any(
+        note.startswith("Strong FIN consensus reached after mrz_roi")
+        for note in result.notes
+    )
+
+
+def test_detector_stops_after_high_confidence_single_attempt() -> None:
+    image = np.zeros((20, 20, 3), dtype=np.uint8)
+    attempted: list[str] = []
+
+    class FakePreprocessor:
+        @staticmethod
+        def load(_path):
+            return image
+
+        @staticmethod
+        def detect_card_roi(value):
+            return value
+
+    class FakeExtractor:
+        @staticmethod
+        def extract(_image, *, attempt):
+            attempted.append(attempt)
+            return MRZResult(
+                fin="1ABC234",
+                confidence=0.96,
+                line1="",
+                line2="",
+                line3="",
+                checksum_valid=True,
+                method=attempt,
+                card_type="new_card",
+                card_serial_number=None,
+                quality_score=100,
+                fin_is_canonical=True,
+            )
+
+        @staticmethod
+        def is_structurally_valid(result):
+            return result.fin is not None
+
+    detector = FINDetector.__new__(FINDetector)
+    detector.preprocessor = FakePreprocessor()
+    detector.mrz_extractor = FakeExtractor()
+    detector.save_debug_images = False
+    detector._build_attempts = lambda _image: [
+        OCRAttempt("mrz_strip", lambda: image),
+        OCRAttempt("mrz_roi", lambda: image),
+        OCRAttempt("full_image", lambda: image),
+    ]
+
+    result = detector.detect_from_mrz("high-confidence.png")
+
+    assert result.fin == "1ABC234"
+    assert attempted == ["mrz_strip"]
+    assert any(
+        note.startswith("High-confidence FIN accepted after mrz_strip")
+        for note in result.notes
+    )
+
+
+def test_detector_fail_fast_to_original_after_failed_rectified_attempts() -> None:
+    original = np.zeros((40, 40, 3), dtype=np.uint8)
+    bad_rectification = np.ones((40, 40, 3), dtype=np.uint8)
+    attempted: list[str] = []
+
+    class FakePreprocessor:
+        @staticmethod
+        def load(_path):
+            return original
+
+        @staticmethod
+        def detect_card_roi(_image):
+            return bad_rectification
+
+        @staticmethod
+        def extract_td2_line_crops(_image):
+            return []
+
+    class FakeExtractor:
+        @staticmethod
+        def extract(image, *, attempt):
+            attempted.append(attempt)
+            is_original = image is original
+            return MRZResult(
+                fin="3JK6ZEB" if is_original else None,
+                confidence=0.96 if is_original else 0.0,
+                line1="I<AZEBAYRAMOV<<HATAM<<<<<<<<<<<<<<<<" if is_original else "",
+                line2="09163467<6AZE5802014M<<<<<<03JK6ZEB2" if is_original else "",
+                line3="",
+                checksum_valid=is_original,
+                method=f"td2_{attempt}" if is_original else "not_found",
+                card_type="older_card" if is_original else "unknown",
+                card_serial_number="09163467" if is_original else None,
+                quality_score=100 if is_original else 0,
+                fin_is_canonical=is_original,
+                secondary_checksum_valid=is_original,
+            )
+
+        @staticmethod
+        def is_structurally_valid(result):
+            return result.fin is not None
+
+    detector = FINDetector.__new__(FINDetector)
+    detector.preprocessor = FakePreprocessor()
+    detector.mrz_extractor = FakeExtractor()
+    detector.save_debug_images = False
+    detector._build_attempts = lambda source: [
+        OCRAttempt("mrz_strip", lambda source=source: source),
+        OCRAttempt("mrz_roi", lambda source=source: source),
+        OCRAttempt("mrz_strip_wide", lambda source=source: source),
+        OCRAttempt("mrz_strip_tight", lambda source=source: source),
+        OCRAttempt("full_image", lambda source=source: source),
+    ]
+
+    result = detector.detect_from_mrz("fail-fast-roi.png")
+
+    assert result.fin == "3JK6ZEB"
+    assert attempted == [
+        "mrz_strip",
+        "mrz_roi",
+        "mrz_strip_wide",
+        "original_mrz_strip",
+    ]
+    assert any(
+        note.startswith(
+            "Rectified crop produced no MRZ after 3 attempts; "
+            "trying original image."
+        )
+        for note in result.notes
+    )
+    assert any(
+        note.startswith("High-confidence FIN accepted after original_mrz_strip")
+        for note in result.notes
+    )
 
 
 def test_detector_attempts_prioritize_grayscale_before_binarized() -> None:

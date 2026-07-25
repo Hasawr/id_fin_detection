@@ -59,6 +59,7 @@ class Settings:
     audit_store_payloads: bool = False
     audit_retention_days: int = 30
     audit_max_payload_bytes: int = 1024 * 1024 * 1024
+    ocr_api_base_url: str = "http://127.0.0.1:8000"
 
 
 @lru_cache(maxsize=1)
@@ -121,6 +122,10 @@ def get_settings() -> Settings:
             minimum=0,
             maximum=1024 * 1024 * 1024 * 1024,
         ),
+        ocr_api_base_url=(
+            os.getenv("OCR_API_BASE_URL")
+            or "http://127.0.0.1:8000"
+        ).rstrip("/"),
     )
 
 

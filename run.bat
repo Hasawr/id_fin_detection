@@ -27,7 +27,7 @@ if not exist ".env" (
     echo [INFO] Created .env with a random API key.
 )
 
-%PYTHON_COMMAND% -c "import ctypes, fastapi, uvicorn, streamlit, multipart, dotenv, cv2, paddle; from importlib.metadata import version; from services.id_fin.detector import configure_nvidia_dll_directories; assert version('paddleocr') == '2.10.0'; assert all(version(name) == '4.11.0.86' for name in ('opencv-python', 'opencv-contrib-python', 'opencv-python-headless')); configure_nvidia_dll_directories(); assert paddle.device.is_compiled_with_cuda(); ctypes.WinDLL('cudnn64_8.dll')" >nul 2>&1
+%PYTHON_COMMAND% -c "import ctypes, fastapi, httpx, uvicorn, streamlit, multipart, dotenv, cv2, paddle; from importlib.metadata import version; from services.id_fin.detector import configure_nvidia_dll_directories; assert version('paddleocr') == '2.10.0'; assert all(version(name) == '4.11.0.86' for name in ('opencv-python', 'opencv-contrib-python', 'opencv-python-headless')); configure_nvidia_dll_directories(); assert paddle.device.is_compiled_with_cuda(); ctypes.WinDLL('cudnn64_8.dll')" >nul 2>&1
 if errorlevel 1 (
     echo [INFO] Installing missing dependencies and CUDA-enabled PaddlePaddle...
     %PYTHON_COMMAND% -m pip uninstall -y paddlepaddle >nul 2>&1
@@ -52,10 +52,24 @@ if /i "%~1"=="--check" (
 )
 
 echo Starting OCR backend at http://127.0.0.1:8000
-echo Starting Streamlit frontend at http://127.0.0.1:8501
 echo [SECURITY] Streamlit is local-only. Do not expose port 8501 publicly.
 
 start "OCR API Backend" cmd /k ""%PYTHON_COMMAND%" -m uvicorn api.main:app --host 127.0.0.1 --port 8000"
+
+echo Waiting for the OCR backend to become healthy...
+for /l %%I in (1,1,60) do (
+    powershell -NoProfile -Command "try { $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 1; if ($response.StatusCode -eq 200) { exit 0 }; exit 1 } catch { exit 1 }" >nul 2>&1
+    if not errorlevel 1 goto backend_ready
+    timeout /t 1 /nobreak >nul
+)
+
+echo [ERROR] OCR backend did not become healthy within 60 seconds.
+echo Review the OCR API Backend window for startup errors.
+pause
+exit /b 1
+
+:backend_ready
+echo Starting Streamlit frontend at http://127.0.0.1:8501
 start "OCR Streamlit Frontend" cmd /k ""%PYTHON_COMMAND%" -m streamlit run demos\streamlit_app.py --server.address 127.0.0.1 --server.port 8501"
 
 echo.

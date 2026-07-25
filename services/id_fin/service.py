@@ -4,6 +4,7 @@ from functools import lru_cache
 import asyncio
 import logging
 from pathlib import Path
+from threading import Event, Lock
 
 from shared.config import Settings, get_settings
 from services.id_fin import FINDetectionOutput
@@ -11,6 +12,10 @@ from services.id_fin.detector import FINDetector
 
 
 logger = logging.getLogger(__name__)
+
+
+class ServiceClosedError(RuntimeError):
+    """Raised when OCR work is submitted after service shutdown."""
 
 
 def serialize_fin_detection(
@@ -49,6 +54,9 @@ class IDFinService:
             max_workers=1,
             thread_name_prefix="id-fin-ocr",
         )
+        self._lifecycle_lock = Lock()
+        self._is_closed = False
+        self._close_complete = Event()
         logger.info("ID FIN service ready with one OCR engine")
 
     async def process(
@@ -64,18 +72,23 @@ class IDFinService:
         *,
         image_path: Path,
     ) -> FINDetectionOutput:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._executor,
-            self._detector.detect_from_mrz,
-            image_path,
-        )
+        with self._lifecycle_lock:
+            if self._is_closed:
+                raise ServiceClosedError("ID FIN service is closed.")
+            future = self._executor.submit(
+                self._detector.detect_from_mrz,
+                image_path,
+            )
+        return await asyncio.wrap_future(future)
 
     async def process_many(
         self,
         *,
         image_paths: list[Path],
     ) -> list[dict[str, object]]:
+        with self._lifecycle_lock:
+            if self._is_closed:
+                raise ServiceClosedError("ID FIN service is closed.")
         if not image_paths:
             return []
 
@@ -86,7 +99,20 @@ class IDFinService:
         return results
 
     def close(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._lifecycle_lock:
+            if self._is_closed:
+                is_first_closer = False
+            else:
+                self._is_closed = True
+                is_first_closer = True
+        if not is_first_closer:
+            self._close_complete.wait()
+            return
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+        finally:
+            self._close_complete.set()
+        logger.info("ID FIN service shut down after draining OCR work")
 
 @lru_cache(maxsize=1)
 def get_id_fin_service() -> IDFinService:
