@@ -73,6 +73,45 @@ def test_mrz_roi_returns_none_without_text_structure() -> None:
     assert ImagePreprocessor.detect_mrz_roi(blank) is None
 
 
+def test_td2_line_crops_find_two_bottom_mrz_rows() -> None:
+    card = np.full((400, 700, 3), 235, dtype=np.uint8)
+    cv2.putText(
+        card,
+        "I<AZEBAYRAMOV<<HATAM<<<<<<<<<<<<<<",
+        (25, 345),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (10, 10, 10),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        card,
+        "09163467<6AZE5802014M<<<<<<03JK6ZEB2",
+        (25, 382),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (10, 10, 10),
+        2,
+        cv2.LINE_AA,
+    )
+
+    lines = ImagePreprocessor.extract_td2_line_crops(card)
+
+    assert len(lines) == 2
+    assert all(line.shape[1] >= ImagePreprocessor.MIN_MRZ_OCR_WIDTH for line in lines)
+
+
+def test_td2_line_crops_fall_back_for_fragmented_thin_rows() -> None:
+    card = np.full((400, 700, 3), 235, dtype=np.uint8)
+    card[345, 100:300] = 10
+    card[382, 100:300] = 10
+
+    lines = ImagePreprocessor.extract_td2_line_crops(card)
+
+    assert len(lines) == 2
+
+
 def test_mrz_upscale_and_binarize_helpers() -> None:
     small = np.full((40, 200, 3), 180, dtype=np.uint8)
     cv2.putText(

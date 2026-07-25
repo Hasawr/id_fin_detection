@@ -46,6 +46,9 @@ def configure_nvidia_dll_directories() -> None:
 
 
 class FINDetector:
+    ORIGINAL_IMAGE_RECOVERY_ATTEMPTS = frozenset(
+        {"mrz_strip", "mrz_roi", "full_image"}
+    )
     RECOVERY_ATTEMPTS = frozenset(
         {
             "deskewed_mrz_roi",
@@ -53,6 +56,10 @@ class FINDetector:
             "deskewed_mrz_strip_binarized",
             "full_image",
             "deskewed_full_image",
+            "line_recognition",
+            "original_mrz_strip",
+            "original_mrz_roi",
+            "original_full_image",
         }
     )
     def __init__(
@@ -160,6 +167,64 @@ class FINDetector:
                             f"{attempt.name}."
                         )
                         break
+
+            if not valid_results and rectified is not image:
+                for attempt in self._build_attempts(image):
+                    if (
+                        attempt.name
+                        not in self.ORIGINAL_IMAGE_RECOVERY_ATTEMPTS
+                    ):
+                        continue
+                    attempt_image = attempt.image_factory()
+                    if attempt_image is None:
+                        continue
+                    attempt_name = f"original_{attempt.name}"
+                    attempt_started = time.perf_counter()
+                    attempted_result = self.mrz_extractor.extract(
+                        attempt_image,
+                        attempt=attempt_name,
+                    )
+                    attempt_seconds = time.perf_counter() - attempt_started
+                    notes.append(
+                        f"OCR attempt {attempt_name}: "
+                        f"{attempt_seconds:.4f}s."
+                    )
+                    attempted_results.append(attempted_result)
+                    if not self.mrz_extractor.is_structurally_valid(
+                        attempted_result
+                    ):
+                        continue
+                    valid_results.append(attempted_result)
+                    fin_counts = Counter(
+                        result.fin
+                        for result in valid_results
+                        if result.fin
+                    )
+                    if max(fin_counts.values(), default=0) >= 2:
+                        break
+
+            if not valid_results:
+                line_images = self.preprocessor.extract_td2_line_crops(
+                    rectified
+                )
+                if len(line_images) == 2:
+                    attempt_started = time.perf_counter()
+                    attempted_result = (
+                        self.mrz_extractor.extract_recognition_lines(
+                            line_images,
+                            attempt="line_recognition",
+                        )
+                    )
+                    attempt_seconds = time.perf_counter() - attempt_started
+                    notes.append(
+                        "OCR attempt line_recognition: "
+                        f"{attempt_seconds:.4f}s."
+                    )
+                    attempted_results.append(attempted_result)
+                    if self.mrz_extractor.is_structurally_valid(
+                        attempted_result
+                    ):
+                        valid_results.append(attempted_result)
 
             if valid_results:
                 fin_counts = Counter(

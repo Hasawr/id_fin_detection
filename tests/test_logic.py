@@ -102,6 +102,32 @@ def test_old_card_td2_fin_extraction() -> None:
     assert result.line3 == ""
 
 
+def test_td2_recognition_only_fallback_parses_visible_old_card() -> None:
+    class FakeOCR:
+        @staticmethod
+        def ocr(images, *, det, rec, cls):
+            assert len(images) == 2
+            assert (det, rec, cls) == (False, True, False)
+            return [
+                [
+                    ("I<AZEBAYRAMOV<<HATAM<<<<<<<<<<<<<<<<", 0.95),
+                    ("09163467<6AZE5802014M<<<<<<03JK6ZEB2", 0.96),
+                ]
+            ]
+
+    extractor = MRZExtractor(FakeOCR())
+    result = extractor.extract_recognition_lines(
+        [np.zeros((30, 300, 3)), np.zeros((30, 300, 3))],
+        attempt="line_recognition",
+    )
+
+    assert result.fin == "3JK6ZEB"
+    assert result.card_serial_number == "09163467"
+    assert result.checksum_valid is True
+    assert result.secondary_checksum_valid is True
+    assert result.method == "td2_line_recognition"
+
+
 def test_exact_new_and_old_card_mrz_layouts() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
     new_card = _parse_td1_for_test(

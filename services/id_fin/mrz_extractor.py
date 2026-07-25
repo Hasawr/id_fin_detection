@@ -82,6 +82,48 @@ class MRZExtractor:
         merged_lines = self._prefer_mrz_like_lines(merged_lines)
         return self._select_best_result(merged_lines, attempt)
 
+    def extract_recognition_lines(
+        self,
+        line_images: list,
+        *,
+        attempt: str,
+    ) -> MRZResult:
+        """Recognize pre-cropped MRZ lines when text detection found nothing."""
+        if len(line_images) != 2:
+            return self._not_found()
+        try:
+            raw_results = self.ocr.ocr(
+                line_images,
+                det=False,
+                rec=True,
+                cls=False,
+            )
+        except Exception:
+            logger.exception("PaddleOCR line recognition recovery failed")
+            return self._not_found()
+
+        recognition_results = (
+            raw_results[0]
+            if raw_results
+            and len(raw_results) == 1
+            and isinstance(raw_results[0], list)
+            else raw_results
+        )
+        if not recognition_results:
+            return self._not_found()
+
+        lines: list[tuple[str, float]] = []
+        for result in recognition_results:
+            if not isinstance(result, (list, tuple)) or len(result) != 2:
+                continue
+            text, confidence = result
+            cleaned = clean_mrz_line(str(text))
+            if cleaned:
+                lines.append((cleaned, float(confidence)))
+        if len(lines) != 2:
+            return self._diagnostic_result(lines)
+        return self._select_best_result(lines, attempt)
+
     @classmethod
     def _mrz_line_score(cls, text: str) -> float:
         """Score how MRZ-like a cleaned OCR line is vs normal card prose."""

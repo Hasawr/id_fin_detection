@@ -145,6 +145,146 @@ def test_detector_runs_recovery_for_single_candidate_and_picks_quality() -> None
     assert result.mrz_result.method == "full_image"
 
 
+def test_detector_uses_td2_line_recognition_when_detection_finds_nothing() -> None:
+    image = np.zeros((40, 80, 3), dtype=np.uint8)
+    line_images = [
+        np.zeros((10, 80, 3), dtype=np.uint8),
+        np.zeros((10, 80, 3), dtype=np.uint8),
+    ]
+
+    class FakePreprocessor:
+        @staticmethod
+        def load(_path):
+            return image
+
+        @staticmethod
+        def detect_card_roi(value):
+            return value
+
+        @staticmethod
+        def extract_td2_line_crops(_image):
+            return line_images
+
+    class FakeExtractor:
+        @staticmethod
+        def extract(_image, *, attempt):
+            return MRZResult(
+                fin=None,
+                confidence=0.0,
+                line1="",
+                line2="",
+                line3="",
+                checksum_valid=False,
+                method=attempt,
+                card_type="unknown",
+                card_serial_number=None,
+            )
+
+        @staticmethod
+        def extract_recognition_lines(images, *, attempt):
+            assert all(
+                actual is expected
+                for actual, expected in zip(images, line_images, strict=True)
+            )
+            return MRZResult(
+                fin="3JK6ZEB",
+                confidence=0.96,
+                line1="I<AZEBAYRAMOV<<HATAM<<<<<<<<<<<<<<<<",
+                line2="09163467<6AZE5802014M<<<<<<03JK6ZEB2",
+                line3="",
+                checksum_valid=True,
+                method=f"td2_{attempt}",
+                card_type="older_card",
+                card_serial_number="09163467",
+                quality_score=100,
+                secondary_checksum_valid=True,
+            )
+
+        @staticmethod
+        def is_structurally_valid(result):
+            return result.fin is not None
+
+    detector = FINDetector.__new__(FINDetector)
+    detector.preprocessor = FakePreprocessor()
+    detector.mrz_extractor = FakeExtractor()
+    detector.save_debug_images = False
+    detector._build_attempts = lambda _image: [
+        OCRAttempt("mrz_strip", lambda: image),
+    ]
+
+    result = detector.detect_from_mrz("old-card.png")
+
+    assert result.fin == "3JK6ZEB"
+    assert result.mrz_result is not None
+    assert result.mrz_result.method == "td2_line_recognition"
+    assert any(
+        note.startswith("OCR attempt line_recognition:")
+        for note in result.notes
+    )
+
+
+def test_detector_retries_original_image_after_bad_card_rectification() -> None:
+    original = np.zeros((80, 120, 3), dtype=np.uint8)
+    bad_rectification = np.ones((30, 40, 3), dtype=np.uint8)
+
+    class FakePreprocessor:
+        @staticmethod
+        def load(_path):
+            return original
+
+        @staticmethod
+        def detect_card_roi(_image):
+            return bad_rectification
+
+    class FakeExtractor:
+        @staticmethod
+        def extract(image, *, attempt):
+            is_original = image is original
+            return MRZResult(
+                fin="3JK6ZEB" if is_original else None,
+                confidence=0.96 if is_original else 0.0,
+                line1=(
+                    "I<AZEBAYRAMOV<<HATAM<<<<<<<<<<<<<<<<"
+                    if is_original
+                    else ""
+                ),
+                line2=(
+                    "09163467<6AZE5802014M<<<<<<03JK6ZEB2"
+                    if is_original
+                    else ""
+                ),
+                line3="",
+                checksum_valid=is_original,
+                method=f"td2_{attempt}" if is_original else "not_found",
+                card_type="older_card" if is_original else "unknown",
+                card_serial_number="09163467" if is_original else None,
+                quality_score=100 if is_original else 0,
+                secondary_checksum_valid=is_original,
+            )
+
+        @staticmethod
+        def is_structurally_valid(result):
+            return result.fin is not None
+
+    detector = FINDetector.__new__(FINDetector)
+    detector.preprocessor = FakePreprocessor()
+    detector.mrz_extractor = FakeExtractor()
+    detector.save_debug_images = False
+    detector._build_attempts = lambda source: [
+        OCRAttempt("mrz_strip", lambda: source),
+    ]
+
+    result = detector.detect_from_mrz("bad-roi.png")
+
+    assert result.fin == "3JK6ZEB"
+    assert result.mrz_result is not None
+    assert result.mrz_result.method == "td2_original_mrz_strip"
+    assert any(
+        note.startswith("OCR attempt original_mrz_strip:")
+        for note in result.notes
+    )
+
+
 def test_detector_stops_before_recovery_after_strong_consensus() -> None:
     image = np.zeros((20, 20, 3), dtype=np.uint8)
     attempted: list[str] = []

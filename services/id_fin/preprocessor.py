@@ -8,6 +8,7 @@ class ImagePreprocessor:
     MRZ_HEIGHT_RATIO = 0.35
     MRZ_HEIGHT_RATIO_TIGHT = 0.28
     MRZ_HEIGHT_RATIO_WIDE = 0.45
+    TD2_MRZ_HEIGHT_RATIO = 0.24
     DEFAULT_MAX_OCR_SIDE = 1600
     MIN_MRZ_OCR_WIDTH = 1200
     CARD_MIN_AREA_RATIO = 0.04
@@ -91,6 +92,78 @@ class ImagePreprocessor:
         height, width = image.shape[:2]
         top = int(height * (1.0 - ratio))
         return image[top:height, 0:width]
+
+    @classmethod
+    def extract_td2_line_crops(
+        cls,
+        image: np.ndarray,
+    ) -> list[np.ndarray]:
+        """Locate the two bottom MRZ lines for recognition-only recovery."""
+        strip = cls.crop_mrz_strip(
+            image,
+            height_ratio=cls.TD2_MRZ_HEIGHT_RATIO,
+        )
+        if strip.shape[0] < 20 or strip.shape[1] < 120:
+            return []
+
+        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+        _, ink = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+        row_ink = np.count_nonzero(ink, axis=1)
+        minimum_ink = max(2, round(strip.shape[1] * 0.008))
+        maximum_ink = strip.shape[1] * 0.70
+        active_rows = np.flatnonzero(
+            (row_ink >= minimum_ink) & (row_ink <= maximum_ink)
+        )
+        if active_rows.size == 0:
+            return []
+
+        bands: list[tuple[int, int]] = []
+        start = end = int(active_rows[0])
+        for row in active_rows[1:]:
+            row = int(row)
+            if row <= end + 2:
+                end = row
+                continue
+            bands.append((start, end))
+            start = end = row
+        bands.append((start, end))
+
+        minimum_height = max(3, round(strip.shape[0] * 0.04))
+        text_bands = [
+            (start, end)
+            for start, end in bands
+            if end - start + 1 >= minimum_height
+        ]
+        if len(text_bands) >= 2:
+            selected_bands = sorted(
+                text_bands,
+                key=lambda band: band[1],
+            )[-2:]
+        else:
+            # Low-resolution OCR-B strokes can fragment into one-pixel rows.
+            # Older TD2 cards consistently place two MRZ lines in this band.
+            strip_height = strip.shape[0]
+            selected_bands = [
+                (0, max(1, round(strip_height * 0.50) - 1)),
+                (
+                    round(strip_height * 0.45),
+                    max(1, round(strip_height * 0.95) - 1),
+                ),
+            ]
+        padding = max(2, round(strip.shape[0] * 0.025))
+        line_crops = []
+        for start, end in selected_bands:
+            top = max(0, start - padding)
+            bottom = min(strip.shape[0], end + padding + 1)
+            line = strip[top:bottom]
+            enhanced = cls.enhance_mrz_image(line)
+            line_crops.append(cls.upscale_mrz_if_needed(enhanced))
+        return line_crops
 
     @classmethod
     def prepare_mrz_for_ocr(

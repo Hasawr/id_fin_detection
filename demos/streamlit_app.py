@@ -33,7 +33,7 @@ st.markdown(
 )
 
 # Increment when cached detector/result objects become incompatible.
-RESULT_SCHEMA_VERSION = 10
+RESULT_SCHEMA_VERSION = 12
 
 
 @st.cache_resource
