@@ -119,6 +119,7 @@ class FINDetector:
             valid_results = []
             roi_applied = rectified is not image
             failed_rectified_attempts = 0
+
             for attempt in attempts:
                 fin_counts = Counter(
                     result.fin for result in valid_results if result.fin
@@ -236,57 +237,74 @@ class FINDetector:
                     ):
                         valid_results.append(attempted_result)
 
-            if valid_results:
-                fin_counts = Counter(
-                    result.fin for result in valid_results if result.fin
-                )
-                mrz_result = max(
-                    valid_results,
-                    key=lambda result: self._result_rank(
-                        result,
-                        fin_counts,
-                    ),
-                )
-                notes.append(
-                    f"FIN selected from {mrz_result.method} with "
-                    f"{fin_counts[mrz_result.fin]} agreeing attempt(s)."
-                )
-            elif attempted_results:
-                mrz_result = max(
-                    attempted_results,
-                    key=lambda result: result.confidence,
-                )
-                notes.append(
-                    "MRZ region was not reliably detected, or OCR output "
-                    "did not contain a valid TD1/TD2 structure."
-                )
-            else:
-                mrz_result = None
-
-            if mrz_result is None:
-                raise RuntimeError("OCR attempt pipeline produced no result.")
-
-            if self.save_debug_images:
-                annotated = draw_mrz_debug(
-                    rectified,
-                    mrz_result.line1,
-                    mrz_result.line2,
-                    mrz_result.line3,
-                    mrz_result.fin or "NOT_FOUND",
-                )
-                save_debug_image(annotated, f"debug_mrz_{image_path.name}")
-                notes.append("Saved MRZ debug image.")
-            return FINDetectionOutput(
-                fin=mrz_result.fin,
-                confidence=mrz_result.confidence,
-                mrz_result=mrz_result,
+            return self._finalize_detection(
+                rectified=rectified,
+                attempted_results=attempted_results,
+                valid_results=valid_results,
                 notes=notes,
+                image_path=image_path,
             )
         except Exception as exc:
             logger.exception("Error processing MRZ image %s", image_path.name)
             raise OCRProcessingError(
                 f"Failed to process MRZ image {image_path.name}."
             ) from exc
+
+    def _finalize_detection(
+        self,
+        *,
+        rectified,
+        attempted_results: list,
+        valid_results: list,
+        notes: list[str],
+        image_path: Path,
+    ) -> FINDetectionOutput:
+        if valid_results:
+            fin_counts = Counter(
+                result.fin for result in valid_results if result.fin
+            )
+            mrz_result = max(
+                valid_results,
+                key=lambda result: self._result_rank(
+                    result,
+                    fin_counts,
+                ),
+            )
+            notes.append(
+                f"FIN selected from {mrz_result.method} with "
+                f"{fin_counts[mrz_result.fin]} agreeing attempt(s)."
+            )
+        elif attempted_results:
+            mrz_result = max(
+                attempted_results,
+                key=lambda result: result.confidence,
+            )
+            notes.append(
+                "MRZ region was not reliably detected, or OCR output "
+                "did not contain a valid TD1/TD2 structure."
+            )
+        else:
+            mrz_result = None
+
+        if mrz_result is None:
+            raise RuntimeError("OCR attempt pipeline produced no result.")
+
+        if self.save_debug_images:
+            annotated = draw_mrz_debug(
+                rectified,
+                mrz_result.line1,
+                mrz_result.line2,
+                mrz_result.line3,
+                mrz_result.fin or "NOT_FOUND",
+            )
+            save_debug_image(annotated, f"debug_mrz_{image_path.name}")
+            notes.append("Saved MRZ debug image.")
+        return FINDetectionOutput(
+            fin=mrz_result.fin,
+            confidence=mrz_result.confidence,
+            mrz_result=mrz_result,
+            notes=notes,
+        )
 
     @classmethod
     def _is_high_confidence_accept(cls, result) -> bool:

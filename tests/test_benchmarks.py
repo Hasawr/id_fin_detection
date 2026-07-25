@@ -24,6 +24,7 @@ def test_native_decoder_dependencies_are_pinned_to_safe_versions() -> None:
         Path(__file__).resolve().parents[1] / "requirements.txt"
     ).read_text(encoding="utf-8")
     assert "paddleocr==2.10.0" in requirements
+    assert "onnxruntime" not in requirements
     assert requirements.count("4.11.0.86") == 3
     assert "4.6.0.66" not in requirements
 

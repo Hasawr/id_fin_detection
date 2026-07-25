@@ -99,10 +99,35 @@ class ImagePreprocessor:
         image: np.ndarray,
     ) -> list[np.ndarray]:
         """Locate the two bottom MRZ lines for recognition-only recovery."""
-        strip = cls.crop_mrz_strip(
+        return cls.extract_mrz_line_crops(
             image,
+            line_count=2,
             height_ratio=cls.TD2_MRZ_HEIGHT_RATIO,
         )
+
+    @classmethod
+    def extract_mrz_line_crops(
+        cls,
+        image: np.ndarray,
+        *,
+        line_count: int = 2,
+        height_ratio: float | None = None,
+    ) -> list[np.ndarray]:
+        """Locate MRZ line bands for recognition-only paths."""
+        if line_count not in {2, 3}:
+            raise ValueError("line_count must be 2 or 3.")
+        if height_ratio == 0.0:
+            # Caller already provided an MRZ strip/ROI crop.
+            strip = image
+        else:
+            strip = cls.crop_mrz_strip(
+                image,
+                height_ratio=(
+                    cls.TD2_MRZ_HEIGHT_RATIO
+                    if height_ratio is None
+                    else height_ratio
+                ),
+            )
         if strip.shape[0] < 20 or strip.shape[1] < 120:
             return []
 
@@ -139,22 +164,23 @@ class ImagePreprocessor:
             for start, end in bands
             if end - start + 1 >= minimum_height
         ]
-        if len(text_bands) >= 2:
+        if len(text_bands) >= line_count:
             selected_bands = sorted(
                 text_bands,
                 key=lambda band: band[1],
-            )[-2:]
+            )[-line_count:]
         else:
             # Low-resolution OCR-B strokes can fragment into one-pixel rows.
-            # Older TD2 cards consistently place two MRZ lines in this band.
+            # Fall back to evenly spaced geometric bands.
             strip_height = strip.shape[0]
-            selected_bands = [
-                (0, max(1, round(strip_height * 0.50) - 1)),
-                (
-                    round(strip_height * 0.45),
-                    max(1, round(strip_height * 0.95) - 1),
-                ),
-            ]
+            selected_bands = []
+            for index in range(line_count):
+                top = round(strip_height * (index / line_count))
+                bottom = max(
+                    top + 1,
+                    round(strip_height * ((index + 1) / line_count)) - 1,
+                )
+                selected_bands.append((top, bottom))
         padding = max(2, round(strip.shape[0] * 0.025))
         line_crops = []
         for start, end in selected_bands:
