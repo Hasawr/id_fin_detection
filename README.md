@@ -146,9 +146,10 @@ services/
   passport/             Passport service placeholder
 shared/                 Configuration and secure upload handling
 demos/
+  streamlit_app.py      Internal Streamlit demo (top-tab navigation)
+  audit_dashboard.py    Integration Audit tab
   cli.py                Local command-line interface
-  streamlit_app.py      Internal Streamlit demo
-  pages/                Streamlit pages (Integration Audit)
+
 shared/audit.py         SQLite audit store for third-party API calls
 tests/                  Logic and HTTP contract tests
 benchmarks/             PII-safe local accuracy and GPU performance harness
@@ -174,7 +175,7 @@ python demos\cli.py --mrz C:\images\first-back.jpg C:\images\second-back.jpg --o
 streamlit run demos\streamlit_app.py
 ```
 
-In Streamlit, use the sidebar page **Integration Audit** to inspect third-party
+In Streamlit, use the top **Integration Audit** tab to inspect third-party
 API traffic recorded while the FastAPI backend is running.
 
 ## Tests
