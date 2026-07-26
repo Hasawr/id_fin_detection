@@ -26,6 +26,7 @@ from shared.config import get_settings
 
 AUDIT_SCHEMA_VERSION = 2
 PAGE_SIZE = 8
+RECEIVED_IMAGE_WIDTH_PX = 340
 EVENT_FETCH_LIMIT = 200
 
 @st.cache_resource
@@ -35,6 +36,18 @@ def load_store(_schema_version: int) -> AuditStore:
         audit_settings.audit_db_path,
         payload_dir=audit_settings.audit_payload_dir,
     )
+
+
+def format_bytes(size: object) -> str:
+    try:
+        value = float(size)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if value < 1024:
+        return f"{value:.0f} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KB"
+    return f"{value / (1024 * 1024):.1f} MB"
 
 
 def client_label(fingerprint: str | None, labels: dict[str, str]) -> str:
@@ -587,10 +600,23 @@ def render_integration_audit() -> None:
             # A multipart content type carries a per-request boundary token
             # that is pure noise here; the media type is the useful part.
             content_type = (selected.request_content_type or "").split(";")[0]
+            uploaded_bytes = sum(
+                int(item.get("size_bytes") or 0)
+                for item in selected.request_files
+            )
             overview_rows = [
                 ("Service", selected.service, False),
-                ("Stored request files", str(len(selected.request_files)), False),
-                ("User agent", selected.user_agent, True),
+                ("Sent by client", selected.user_agent, True),
+                (
+                    "Request payload",
+                    (
+                        f"{len(selected.request_files)} part(s), "
+                        f"{format_bytes(uploaded_bytes)}"
+                        if selected.request_files
+                        else ""
+                    ),
+                    False,
+                ),
                 ("Query", selected.request_query, True),
                 ("Content type", content_type, True),
                 ("Error code", selected.error_code, False),
@@ -601,51 +627,108 @@ def render_integration_audit() -> None:
                 if not value:
                     continue
                 st.markdown(f"**{label}**  \n{f'`{value}`' if mono else value}")
-            if not selected.request_files:
-                st.caption(
-                    "Request files are only kept when AUDIT_STORE_PAYLOADS is "
-                    "enabled; 0 here does not mean nothing was uploaded."
-                )
 
         with request_tab:
             if not selected.request_files:
-                st.info("No uploaded files were saved for this call.")
+                st.info(
+                    "Nothing was recorded for this request. Calls made before "
+                    "request metadata was captured show no parts here."
+                )
             else:
-                st.caption(f"{len(selected.request_files)} saved file(s)")
-                for item in selected.request_files:
-                    saved = item.get("saved_path")
-                    label = item.get("file_name") or item.get("field") or "upload"
-                    if not saved:
-                        st.caption(f"No saved path for {label}")
-                        continue
+                uploads = [
+                    item
+                    for item in selected.request_files
+                    if item.get("file_name")
+                ]
+                fields = [
+                    item
+                    for item in selected.request_files
+                    if not item.get("file_name")
+                ]
+                total_bytes = sum(
+                    int(item.get("size_bytes") or 0)
+                    for item in selected.request_files
+                )
+                st.caption(
+                    f"{len(uploads)} file(s), {len(fields)} form field(s) · "
+                    f"{format_bytes(total_bytes)} received"
+                )
 
-                    try:
-                        file_path = resolve_saved_path(str(saved), store)
-                    except ValueError:
-                        st.error(f"Unsafe saved path blocked: {label}")
-                        continue
-                    if not file_path.exists():
-                        st.warning(f"Missing file: {label}")
-                        continue
-
+                # File metadata is always recorded; the bytes only exist when
+                # AUDIT_STORE_PAYLOADS was on, so render each independently.
+                for index, item in enumerate(selected.request_files):
+                    label = (
+                        item.get("file_name")
+                        or item.get("field")
+                        or "upload"
+                    )
                     with st.container(border=True):
-                        st.markdown(f"**{label}**")
+                        meta = " · ".join(
+                            part
+                            for part in (
+                                f"field `{item['field']}`"
+                                if item.get("field")
+                                else "",
+                                str(item.get("content_type") or ""),
+                                format_bytes(item.get("size_bytes")),
+                            )
+                            if part
+                        )
+                        st.markdown(f"**{html.escape(str(label))}**")
+                        st.caption(meta)
+
+                        preview = item.get("value_preview")
+                        if preview:
+                            st.code(str(preview), language=None)
+
+                        saved = item.get("saved_path")
+                        if not saved:
+                            continue
+                        try:
+                            file_path = resolve_saved_path(str(saved), store)
+                        except ValueError:
+                            st.error(f"Unsafe saved path blocked: {label}")
+                            continue
+                        if not file_path.exists():
+                            st.warning(
+                                "The stored copy of this file has since been "
+                                "pruned."
+                            )
+                            continue
+
                         content_type = str(item.get("content_type") or "")
-                        is_image = content_type.startswith("image/") or file_path.suffix.lower() in {
+                        is_image = content_type.startswith(
+                            "image/"
+                        ) or file_path.suffix.lower() in {
                             ".png",
                             ".jpg",
                             ".jpeg",
                             ".bmp",
                         }
                         if is_image:
-                            st.image(str(file_path), use_container_width=True)
+                            # A preview, not a full-bleed image: at container
+                            # width this crowds out the rest of the call
+                            # detail. Streamlit's hover control expands it.
+                            st.image(
+                                str(file_path),
+                                width=RECEIVED_IMAGE_WIDTH_PX,
+                            )
                         st.download_button(
                             "Download file",
                             data=file_path.read_bytes(),
                             file_name=file_path.name,
-                            key=f"download-{selected.id}-{file_path.name}",
+                            key=f"download-{selected.id}-{index}-{file_path.name}",
                             use_container_width=True,
                         )
+
+                if not any(
+                    item.get("saved_path") for item in selected.request_files
+                ):
+                    st.caption(
+                        "File contents are not retained. Set "
+                        "`AUDIT_STORE_PAYLOADS=true` to keep the uploaded "
+                        "images alongside this metadata."
+                    )
 
         with response_tab:
             if selected.response_body is None:

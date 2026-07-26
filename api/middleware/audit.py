@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from email.parser import BytesParser
 from email.policy import default
-from pathlib import Path
 from typing import Any, Callable
 
+from starlette.datastructures import UploadFile
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -28,6 +29,47 @@ SKIP_PREFIXES = (
     "/openapi.json",
     "/favicon.ico",
 )
+
+
+REQUEST_PARTS_STATE_KEY = "audit_request_parts"
+
+
+def record_request_parts(
+    request: Request,
+    field: str,
+    uploads: list[UploadFile],
+) -> None:
+    """Note what a caller uploaded, using FastAPI's already-parsed uploads.
+
+    The middleware cannot describe the parts itself unless it buffers the
+    whole request body, which is prohibitive for batches of up to 200 images.
+    Routes call this instead: by the time they run, Starlette has already
+    parsed the multipart stream (spooling large parts to disk), so reading
+    the name, media type and size costs nothing extra.
+
+    Only metadata is captured here. The image bytes are still retained solely
+    when AUDIT_STORE_PAYLOADS is enabled.
+    """
+    parts: list[dict[str, Any]] = []
+    for upload in uploads:
+        # UploadFile.name is the spooled temp file's name, not the form
+        # field, so the field is passed in by the route that declared it.
+        size = getattr(upload, "size", None)
+        if size is None:
+            try:
+                size = upload.file.seek(0, os.SEEK_END)
+                upload.file.seek(0)
+            except (AttributeError, OSError, ValueError):
+                size = None
+        parts.append(
+            {
+                "field": field,
+                "file_name": upload.filename,
+                "content_type": upload.content_type,
+                "size_bytes": int(size) if size is not None else None,
+            }
+        )
+    setattr(request.state, REQUEST_PARTS_STATE_KEY, parts)
 
 
 class AuditMiddleware(BaseHTTPMiddleware):
@@ -70,11 +112,31 @@ class AuditMiddleware(BaseHTTPMiddleware):
         store = getattr(request.app.state, "audit_store", None) or get_audit_store()
 
         try:
-            request_files: list[dict[str, Any]] = []
+            # Nothing from a rejected request is retained, not even the part
+            # metadata: an unauthenticated caller must not be able to write
+            # attacker-chosen file names into the audit log.
+            request_accepted = response.status_code < 400
+            request_parts = (
+                self._read_request_parts(
+                    request.headers.get("content-type"),
+                    request_body,
+                )
+                if request_accepted
+                else []
+            )
+            request_files: list[dict[str, Any]] = [
+                description for description, _payload in request_parts
+            ]
+            if request_accepted and not request_files:
+                # Body was not buffered, so fall back to the metadata the
+                # route recorded from its already-parsed uploads.
+                request_files = list(
+                    getattr(request.state, REQUEST_PARTS_STATE_KEY, None) or []
+                )
             payload_dir = None
             if (
                 settings.audit_store_payloads
-                and response.status_code < 400
+                and request_accepted
                 and request_body
                 and store.can_store_payload(
                     len(request_body),
@@ -83,8 +145,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             ):
                 request_files, payload_dir = self._persist_request_payload(
                     store=store,
-                    content_type=request.headers.get("content-type"),
-                    body=request_body,
+                    parts=request_parts,
                 )
             store.record(
                 method=request.method,
@@ -132,40 +193,89 @@ class AuditMiddleware(BaseHTTPMiddleware):
 
         return receive
 
+    def _read_request_parts(
+        self,
+        content_type: str | None,
+        body: bytes,
+    ) -> list[tuple[dict[str, Any], bytes]]:
+        """Describe each uploaded part and keep its bytes for optional storage.
+
+        The description (field, file name, media type, size) is recorded for
+        every call, because it is what lets the audit answer "what did this
+        integration send us?" without retaining the image itself. The bytes
+        are only written to disk when AUDIT_STORE_PAYLOADS is enabled.
+        """
+        if not body:
+            return []
+
+        if content_type and "multipart/form-data" in content_type:
+            message = BytesParser(policy=default).parsebytes(
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8") + body
+            )
+            parts: list[tuple[dict[str, Any], bytes]] = []
+            for index, part in enumerate(message.iter_parts()):
+                payload = part.get_payload(decode=True)
+                if payload is None:
+                    continue
+                field_name = (
+                    part.get_param("name", header="content-disposition")
+                    or f"part_{index}"
+                )
+                file_name = part.get_filename()
+                description: dict[str, Any] = {
+                    "field": field_name,
+                    "file_name": file_name,
+                    "content_type": part.get_content_type(),
+                    "size_bytes": len(payload),
+                }
+                if not file_name:
+                    # Non-file form fields are small scalars, safe to keep.
+                    description["value_preview"] = payload.decode(
+                        "utf-8", errors="replace"
+                    )[:500]
+                parts.append((description, payload))
+            return parts
+
+        extension = ".json" if content_type and "json" in content_type else ".bin"
+        return [
+            (
+                {
+                    "field": "body",
+                    "file_name": f"request_body{extension}",
+                    "content_type": content_type,
+                    "size_bytes": len(body),
+                },
+                body,
+            )
+        ]
+
     def _persist_request_payload(
         self,
         *,
         store: AuditStore,
-        content_type: str | None,
-        body: bytes,
+        parts: list[tuple[dict[str, Any], bytes]],
     ) -> tuple[list[dict[str, Any]], str | None]:
-        if not body:
+        if not parts:
             return [], None
 
         data_root = store.payload_dir.parent
         directory = store.allocate_payload_dir()
         files: list[dict[str, Any]] = []
 
-        if content_type and "multipart/form-data" in content_type:
-            files.extend(
-                self._save_multipart_parts(
-                    directory=directory,
-                    data_root=data_root,
-                    content_type=content_type,
-                    body=body,
-                )
+        for index, (description, payload) in enumerate(parts):
+            fallback = f"part_{index}.bin"
+            safe_name = sanitize_filename(
+                description.get("file_name") or f"{description['field']}.txt",
+                fallback=fallback,
             )
-        else:
-            extension = ".json" if content_type and "json" in content_type else ".bin"
-            path = directory / f"request_body{extension}"
-            path.write_bytes(body)
+            destination = directory / f"{index:02d}_{safe_name}"
+            destination.write_bytes(payload)
             files.append(
                 {
-                    "field": "body",
-                    "file_name": path.name,
-                    "content_type": content_type,
-                    "size_bytes": len(body),
-                    "saved_path": str(path.relative_to(data_root)).replace("\\", "/"),
+                    **description,
+                    "saved_path": str(
+                        destination.relative_to(data_root)
+                    ).replace("\\", "/"),
                 }
             )
 
@@ -174,60 +284,6 @@ class AuditMiddleware(BaseHTTPMiddleware):
             return [], None
 
         return files, str(directory.relative_to(data_root)).replace("\\", "/")
-
-    def _save_multipart_parts(
-        self,
-        *,
-        directory: Path,
-        data_root: Path,
-        content_type: str,
-        body: bytes,
-    ) -> list[dict[str, Any]]:
-        message = BytesParser(policy=default).parsebytes(
-            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8") + body
-        )
-        files: list[dict[str, Any]] = []
-        part_index = 0
-
-        for part in message.iter_parts():
-            payload = part.get_payload(decode=True)
-            if payload is None:
-                continue
-
-            field_name = part.get_param("name", header="content-disposition") or f"part_{part_index}"
-            file_name = part.get_filename()
-            part_content_type = part.get_content_type()
-
-            if file_name:
-                safe_name = sanitize_filename(file_name, fallback=f"{field_name}.bin")
-                destination = directory / f"{part_index:02d}_{safe_name}"
-                destination.write_bytes(payload)
-                files.append(
-                    {
-                        "field": field_name,
-                        "file_name": file_name,
-                        "content_type": part_content_type,
-                        "size_bytes": len(payload),
-                        "saved_path": str(destination.relative_to(data_root)).replace("\\", "/"),
-                    }
-                )
-            else:
-                text_name = sanitize_filename(f"{field_name}.txt", fallback=f"field_{part_index}.txt")
-                destination = directory / f"{part_index:02d}_{text_name}"
-                destination.write_bytes(payload)
-                files.append(
-                    {
-                        "field": field_name,
-                        "file_name": None,
-                        "content_type": part_content_type,
-                        "size_bytes": len(payload),
-                        "value_preview": payload.decode("utf-8", errors="replace")[:500],
-                        "saved_path": str(destination.relative_to(data_root)).replace("\\", "/"),
-                    }
-                )
-            part_index += 1
-
-        return files
 
     @staticmethod
     def _parse_json(body: bytes, content_type: str) -> Any | None:

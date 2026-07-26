@@ -2,9 +2,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 
 from api.auth import require_api_key
+from api.middleware.audit import record_request_parts
 from api.schemas import (
     IdFinBatchData,
     IdFinBatchItem,
@@ -44,10 +45,12 @@ router = APIRouter(
     },
 )
 async def detect_id_fin(
+    request: Request,
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
     settings: Annotated[Settings, Depends(get_settings)],
     mrz: Annotated[UploadFile, File(description="ID card MRZ-side image")],
 ) -> IdFinResponse:
+    record_request_parts(request, "mrz", [mrz])
     with TemporaryDirectory(prefix="ocr-id-fin-") as directory:
         temporary_directory = Path(directory)
         image_path = await save_upload(
@@ -82,6 +85,7 @@ async def detect_id_fin(
     },
 )
 async def detect_id_fin_batch(
+    request: Request,
     service: Annotated[IDFinService, Depends(get_id_fin_service)],
     settings: Annotated[Settings, Depends(get_settings)],
     mrz: Annotated[
@@ -89,6 +93,7 @@ async def detect_id_fin_batch(
         File(description="One or more ID card MRZ-side images"),
     ],
 ) -> IdFinBatchResponse:
+    record_request_parts(request, "mrz", list(mrz))
     if len(mrz) > settings.max_batch_files:
         for upload in mrz:
             await upload.close()

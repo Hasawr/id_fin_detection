@@ -158,8 +158,12 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
         event.response_body["data"]["mrz_details"]["card_serial_number"]
         == "[REDACTED]"
     )
-    assert event.request_files == []
+    # Upload metadata is recorded so the audit can say what was sent, but it
+    # must carry no card data and no copy of the image itself.
+    assert [part["field"] for part in event.request_files] == ["mrz"]
+    assert all("saved_path" not in part for part in event.request_files)
     assert event.payload_dir is None
+    assert "7ABC123" not in str(event.request_files)
     assert "7ABC123" not in str(event.response_body)
     assert "AA1234567" not in str(event.response_body)
     assert "SECRET-MRZ-LINE" not in str(event.response_body)
@@ -555,3 +559,54 @@ def test_api_docs_are_always_visible(client) -> None:
     test_client, _ = client
     assert test_client.get("/docs").status_code == 200
     assert test_client.get("/openapi.json").status_code == 200
+
+
+def test_request_part_metadata_is_recorded_without_storing_payloads(
+    client,
+) -> None:
+    """The audit answers "what did they send?" without keeping the image.
+
+    File names, media types and sizes are not the sensitive part; the image
+    bytes are. Metadata is therefore recorded even with AUDIT_STORE_PAYLOADS
+    off, which is the production default.
+    """
+    test_client, store = client
+    assert app.state.settings.audit_store_payloads is False
+
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("front-side.png", VALID_PNG, "image/png")},
+    )
+    assert response.status_code == 200
+
+    event = store.recent_events(hours=None)[0]
+    assert len(event.request_files) == 1
+    part = event.request_files[0]
+    assert part["field"] == "mrz"
+    assert part["file_name"] == "front-side.png"
+    assert part["content_type"] == "image/png"
+    assert part["size_bytes"] == len(VALID_PNG)
+    # The bytes themselves must not have been kept.
+    assert "saved_path" not in part
+    assert event.payload_dir is None
+
+
+def test_rejected_request_records_no_part_metadata(client) -> None:
+    """An unauthenticated caller must not write into the audit log at all.
+
+    Without this, anyone who can reach the endpoint could persist arbitrary
+    attacker-chosen file names by sending requests that are then rejected.
+    """
+    test_client, store = client
+
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": "invalid"},
+        files={"mrz": ("attacker-chosen-name.png", VALID_PNG, "image/png")},
+    )
+    assert response.status_code == 401
+
+    event = store.recent_events(hours=None)[0]
+    assert event.request_files == []
+    assert event.payload_dir is None
