@@ -141,6 +141,9 @@ def ensure_page_in_bounds(total: int, page_size: int = PAGE_SIZE) -> int:
 
 
 def render_kpis(summary: dict) -> None:
+    # The mean is reported as the secondary figure because batch calls, which
+    # process many images per request, pull it far above a typical call.
+    median_ms = summary.get("median_latency_ms") or 0
     avg_ms = summary.get("avg_latency_ms") or 0
     st.markdown(
         f"""
@@ -152,7 +155,12 @@ def render_kpis(summary: dict) -> None:
           <div class="audit-kpi">
             <div class="label">Detection rate</div>
             <div class="value">{summary['detection_rate']:.0f}%</div>
-            <div class="hint">avg {avg_ms:.0f} ms</div>
+            <div class="hint">of images read</div>
+          </div>
+          <div class="audit-kpi">
+            <div class="label">Median call</div>
+            <div class="value">{median_ms:.0f} ms</div>
+            <div class="hint">mean {avg_ms:.0f} ms</div>
           </div>
         </div>
         """,
@@ -242,7 +250,7 @@ def render_integration_audit() -> None:
 
         .audit-kpis {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(6, minmax(0, 1fr));
             gap: 0.75rem;
             margin: 0.25rem 0 1.1rem 0;
         }
@@ -355,6 +363,11 @@ def render_integration_audit() -> None:
         .meta-cell .k { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.5; }
         .meta-cell .v { font-size: 0.88rem; margin-top: 0.15rem; word-break: break-word; }
 
+        /* Six KPIs in one row need ~1200px before the values start to feel
+           cramped; step down rather than shrinking them indefinitely. */
+        @media (max-width: 1200px) {
+            .audit-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        }
         @media (max-width: 900px) {
             .audit-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .kv-grid, .meta-row { grid-template-columns: 1fr; }
@@ -442,10 +455,6 @@ def render_integration_audit() -> None:
 
     render_kpis(summary)
     render_breakdown(summary, labels)
-
-    st.caption(
-        f"Storage · `{store.db_path.name}` · payloads `{store.payload_dir.name}`"
-    )
 
     if not events:
         st.info("No API calls match these filters yet. Try widening the time window.")
@@ -570,26 +579,33 @@ def render_integration_audit() -> None:
             unsafe_allow_html=True,
         )
 
-        if selected.result_summary:
-            st.markdown(f"**Summary** — {selected.result_summary}")
-
         overview_tab, request_tab, response_tab = st.tabs(
             ["Overview", "Request files", "Response JSON"]
         )
 
         with overview_tab:
+            # A multipart content type carries a per-request boundary token
+            # that is pure noise here; the media type is the useful part.
+            content_type = (selected.request_content_type or "").split(";")[0]
             overview_rows = [
-                ("Service", selected.service or "—", False),
-                ("Files uploaded", str(len(selected.request_files)), False),
-                ("User agent", selected.user_agent or "—", True),
-                ("Query", selected.request_query or "—", True),
-                ("Content type", selected.request_content_type or "—", True),
-                ("Error code", selected.error_code or "—", False),
-                ("Payload dir", selected.payload_dir or "—", True),
+                ("Service", selected.service, False),
+                ("Stored request files", str(len(selected.request_files)), False),
+                ("User agent", selected.user_agent, True),
+                ("Query", selected.request_query, True),
+                ("Content type", content_type, True),
+                ("Error code", selected.error_code, False),
             ]
+            # Rows that are empty for every ordinary call add rows to scan
+            # without adding information, so drop them per call.
             for label, value, mono in overview_rows:
-                rendered = f"`{value}`" if mono else value
-                st.markdown(f"**{label}**  \n{rendered}")
+                if not value:
+                    continue
+                st.markdown(f"**{label}**  \n{f'`{value}`' if mono else value}")
+            if not selected.request_files:
+                st.caption(
+                    "Request files are only kept when AUDIT_STORE_PAYLOADS is "
+                    "enabled; 0 here does not mean nothing was uploaded."
+                )
 
         with request_tab:
             if not selected.request_files:

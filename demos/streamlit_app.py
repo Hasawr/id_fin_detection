@@ -1,4 +1,7 @@
+import csv
 import html
+import io
+import json
 import sys
 import time
 from pathlib import Path
@@ -136,6 +139,16 @@ def on_mrz_files_change() -> None:
     clear_detection_results()
 
 
+def to_csv(rows: list[dict[str, object]]) -> str:
+    if not rows:
+        return ""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
 def has_processing_error(result: IdFinData) -> bool:
     return any(note.startswith("Processing error:") for note in result.notes)
 
@@ -178,9 +191,8 @@ def render_id_fin_demo() -> None:
     with title_col:
         st.markdown("### Azerbaijani ID FIN OCR")
         st.caption(
-            "Internal demo · production API is FastAPI · "
-            f"`{settings.ocr_api_base_url}` · "
-            f"sequential · max batch={settings.max_batch_files}"
+            "Reads the machine-readable zone (MRZ) on an ID card and returns "
+            "the personal FIN and card serial number."
         )
     with status_col:
         if is_backend_ready:
@@ -201,6 +213,15 @@ def render_id_fin_demo() -> None:
     if not has_api_key:
         st.error("API_KEYS is not configured; Streamlit cannot call the API.")
 
+    # Connection details matter when debugging, but they are not what a
+    # reader needs first, so keep them subordinate to the description above.
+    engine_count = settings.ocr_worker_count * settings.ocr_concurrent_attempts
+    st.caption(
+        f"`{settings.ocr_api_base_url}` · up to {settings.max_batch_files} "
+        f"images per batch · {engine_count} OCR engine"
+        f"{'s' if engine_count != 1 else ''}"
+    )
+
     # Stable key keeps uploads bound across st.Page reruns; session_state is
     # the source of truth because the return value can desync in navigation apps.
     st.file_uploader(
@@ -216,10 +237,7 @@ def render_id_fin_demo() -> None:
         mrz_files and len(mrz_files) > settings.max_batch_files
     )
     if mrz_files:
-        st.caption(
-            f"{len(mrz_files)} file(s) selected"
-            + " · sequential"
-        )
+        st.caption(f"{len(mrz_files)} file(s) selected")
         if has_too_many_files:
             st.error(
                 f"Select at most {settings.max_batch_files} images, matching "
@@ -309,35 +327,65 @@ def render_id_fin_demo() -> None:
     if not (detected_results and batch_stats):
         return
 
+    total_images = int(batch_stats["total_images"])
+    detected_count = int(batch_stats["detected"])
+    detection_rate = detected_count / total_images if total_images else 0.0
+
     st.success(
-        f"Completed {batch_stats['total_images']} image(s) in "
-        f"{batch_stats['total_seconds']:.2f}s"
-        + " · sequential"
+        f"Completed {total_images} image(s) in "
+        f"{float(batch_stats['total_seconds']):.2f}s"
     )
 
     st.subheader("Batch summary")
-    metric_cols = st.columns(6)
-    metric_cols[0].metric("Images", int(batch_stats["total_images"]))
-    metric_cols[1].metric("Detected", int(batch_stats["detected"]))
-    metric_cols[2].metric("Not found", int(batch_stats["not_found"]))
-    metric_cols[3].metric("Errors", int(batch_stats["errors"]))
+    metric_cols = st.columns(5)
+    metric_cols[0].metric(
+        "Detection rate",
+        f"{detection_rate:.0%}",
+        help="Share of images where a FIN was successfully read.",
+    )
+    metric_cols[1].metric(
+        "Detected",
+        detected_count,
+        help="Images where a FIN was found.",
+    )
+    metric_cols[2].metric(
+        "Not found",
+        int(batch_stats["not_found"]),
+        help=(
+            "Processed successfully, but no valid MRZ or FIN was present. "
+            "Usually a blurred, cropped, or non-MRZ side image."
+        ),
+    )
+    metric_cols[3].metric(
+        "Errors",
+        int(batch_stats["errors"]),
+        help="Images the API could not process at all.",
+    )
     metric_cols[4].metric(
-        "Throughput",
+        "Speed",
         f"{float(batch_stats['throughput']):.2f}/s",
-    )
-    metric_cols[5].metric(
-        "Wall time",
-        f"{float(batch_stats['total_seconds']):.2f}s",
+        help=(
+            f"Images per second across the whole batch "
+            f"({float(batch_stats['total_seconds']):.2f}s wall time)."
+        ),
     )
 
-    st.write("**Mode:** Sequential single-engine OCR")
-
+    card_type_labels = {
+        "new_card": "New",
+        "older_card": "Older",
+        "unknown": "Unknown",
+    }
     summary_rows = []
     for index, (file_name, result, elapsed) in enumerate(detected_results):
         mrz_result = result.mrz_details
         summary_rows.append(
             {
                 "#": index + 1,
+                "Status": (
+                    "Error"
+                    if has_processing_error(result)
+                    else ("Detected" if result.fin else "Not found")
+                ),
                 "File": file_name,
                 "FIN": result.fin or "—",
                 "Serial": (
@@ -345,26 +393,62 @@ def render_id_fin_demo() -> None:
                     if mrz_result and mrz_result.card_serial_number
                     else "—"
                 ),
-                "Card": (
-                    mrz_result.card_type
-                    if mrz_result is not None
-                    else "unknown"
+                "Card": card_type_labels.get(
+                    mrz_result.card_type if mrz_result else "unknown",
+                    "Unknown",
                 ),
-                "Method": mrz_result.method if mrz_result else "not_found",
-                "Confidence": round(float(result.confidence), 4),
+                # Only meaningful alongside a FIN; see the detail cards.
+                "OCR confidence": (
+                    round(float(result.confidence), 4) if result.fin else None
+                ),
                 "Seconds": round(elapsed, 3),
-                "Status": (
-                    "error"
-                    if has_processing_error(result)
-                    else ("ok" if result.fin else "miss")
-                ),
+                "Method": mrz_result.method if mrz_result else "not_found",
             }
         )
     st.dataframe(
         summary_rows,
         use_container_width=True,
         hide_index=True,
+        column_config={
+            "OCR confidence": st.column_config.ProgressColumn(
+                "OCR confidence",
+                help=(
+                    "Confidence of the recognised MRZ text, not of the FIN "
+                    "itself. Blank when no FIN was read."
+                ),
+                min_value=0.0,
+                max_value=1.0,
+                format="%.1f%%",
+            ),
+            "Seconds": st.column_config.NumberColumn(
+                "Seconds",
+                help="Round trip through the OCR API for this image.",
+                format="%.3f s",
+            ),
+            "Method": st.column_config.TextColumn(
+                "Method",
+                help="Which internal OCR attempt produced the result.",
+            ),
+        },
     )
+
+    export_columns = st.columns([1, 1, 4])
+    with export_columns[0]:
+        st.download_button(
+            "Download CSV",
+            data=to_csv(summary_rows),
+            file_name="id-fin-results.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with export_columns[1]:
+        st.download_button(
+            "Download JSON",
+            data=json.dumps(summary_rows, indent=2, ensure_ascii=False),
+            file_name="id-fin-results.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
     st.subheader("Detailed results")
     with st.container(border=True):
@@ -427,34 +511,37 @@ def render_id_fin_demo() -> None:
     page_end = min(page_start + RESULTS_PER_PAGE, len(filtered_results))
     page_results = filtered_results[page_start:page_end]
 
-    nav_left, nav_center, nav_right = st.columns([1, 2.2, 1])
-    with nav_left:
-        if st.button(
-            "← Previous",
-            disabled=selected_page <= 1,
-            use_container_width=True,
-            key="result_page_prev",
-        ):
-            st.session_state["result_page"] = selected_page - 1
-            st.rerun()
-    with nav_center:
-        st.markdown(
-            f"<div style='text-align:center;padding-top:0.45rem;opacity:0.7;"
-            f"font-size:0.9rem'>"
-            f"Page {selected_page} of {total_pages}"
-            f" · {page_start + 1}–{page_end} of {len(filtered_results)}"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-    with nav_right:
-        if st.button(
-            "Next →",
-            disabled=selected_page >= total_pages,
-            use_container_width=True,
-            key="result_page_next",
-        ):
-            st.session_state["result_page"] = selected_page + 1
-            st.rerun()
+    # Paging controls for a single page are three widgets that can do
+    # nothing, so only render them once there is somewhere else to go.
+    if total_pages > 1:
+        nav_left, nav_center, nav_right = st.columns([1, 2.2, 1])
+        with nav_left:
+            if st.button(
+                "← Previous",
+                disabled=selected_page <= 1,
+                use_container_width=True,
+                key="result_page_prev",
+            ):
+                st.session_state["result_page"] = selected_page - 1
+                st.rerun()
+        with nav_center:
+            st.markdown(
+                f"<div style='text-align:center;padding-top:0.45rem;opacity:0.7;"
+                f"font-size:0.9rem'>"
+                f"Page {selected_page} of {total_pages}"
+                f" · {page_start + 1}–{page_end} of {len(filtered_results)}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with nav_right:
+            if st.button(
+                "Next →",
+                disabled=selected_page >= total_pages,
+                use_container_width=True,
+                key="result_page_next",
+            ):
+                st.session_state["result_page"] = selected_page + 1
+                st.rerun()
 
     for original_index, file_name, result, elapsed in page_results:
         with st.container(border=True):
@@ -467,7 +554,6 @@ def render_id_fin_demo() -> None:
                 ):
                     st.image(
                         mrz_files[original_index],
-                        caption="Preview",
                         width=RESULT_IMAGE_WIDTH_PX,
                     )
                 else:
@@ -487,6 +573,21 @@ def render_id_fin_demo() -> None:
                     if mrz_result is not None and mrz_result.card_serial_number
                     else "—"
                 )
+                # `confidence` scores the OCR text, not whether the FIN is
+                # right, so printing "98%" next to "Not detected" reads as a
+                # contradiction. Only show it when there is a FIN to qualify.
+                confidence_field = (
+                    f"""
+                      <div class="ocr-field">
+                        <span class="ocr-field-label">OCR confidence</span>
+                        <span class="ocr-field-value">
+                          {result.confidence:.1%}
+                        </span>
+                      </div>
+                    """
+                    if result.fin
+                    else ""
+                )
                 st.markdown(
                     f"""
                     <div class="ocr-result-header">
@@ -505,12 +606,7 @@ def render_id_fin_demo() -> None:
                           {html.escape(serial_value)}
                         </span>
                       </div>
-                      <div class="ocr-field">
-                        <span class="ocr-field-label">Confidence</span>
-                        <span class="ocr-field-value">
-                          {result.confidence:.1%}
-                        </span>
-                      </div>
+                      {confidence_field}
                       <div class="ocr-field">
                         <span class="ocr-field-label">Time</span>
                         <span class="ocr-field-value">{elapsed:.2f}s</span>
@@ -523,12 +619,13 @@ def render_id_fin_demo() -> None:
                 if is_error:
                     st.error(result.notes[-1])
                 elif not result.fin:
-                    failure_message = (
+                    # Not a system failure: the image simply had no readable
+                    # MRZ. Red would overstate it next to genuine errors.
+                    st.warning(
                         result.notes[-1]
                         if result.notes
                         else "MRZ or FIN was not detected."
                     )
-                    st.error(failure_message)
 
                 if mrz_result is not None:
                     if mrz_result.card_type == "new_card":
@@ -536,28 +633,52 @@ def render_id_fin_demo() -> None:
                     elif mrz_result.card_type == "older_card":
                         card_label = "Older card (2-line MRZ)"
                     else:
-                        card_label = "Unknown"
+                        card_label = "Unrecognised card layout"
 
-                    checksum_label = (
-                        "checksum valid"
-                        if mrz_result.checksum_valid
-                        else "checksum invalid/unavailable"
-                    )
-                    st.caption(
-                        f"**{card_label}** · `{mrz_result.method}` · "
-                        f"{checksum_label}"
-                    )
+                    if result.fin:
+                        # The API exposes a single bool, so a false value
+                        # cannot distinguish "checksum failed" from "no
+                        # checksum to check". Claim only what it proves.
+                        checksum_label = (
+                            "checksum verified"
+                            if mrz_result.checksum_valid
+                            else "checksum not verified"
+                        )
+                        st.caption(
+                            f"**{card_label}** · `{mrz_result.method}` · "
+                            f"{checksum_label}"
+                        )
+                        # Older TD2 cards genuinely have two MRZ lines, so a
+                        # "line 3 missing" placeholder invents a problem.
+                        mrz_lines = [
+                            mrz_result.line1 or "[Line 1 not detected]",
+                            mrz_result.line2 or "[Line 2 not detected]",
+                        ]
+                        if mrz_result.card_type != "older_card":
+                            mrz_lines.append(
+                                mrz_result.line3 or "[Line 3 not detected]"
+                            )
+                        st.caption("Machine-readable zone")
+                        st.code("\n".join(mrz_lines), language=None)
+                    else:
+                        # With no MRZ recognised there is no layout to name
+                        # and no checksum to report; only the raw text the
+                        # OCR did see is useful for diagnosing the image.
+                        recognised = [
+                            line
+                            for line in (
+                                mrz_result.line1,
+                                mrz_result.line2,
+                                mrz_result.line3,
+                            )
+                            if line
+                        ]
+                        if recognised:
+                            st.caption("Text the OCR did read")
+                            st.code("\n".join(recognised), language=None)
+                        else:
+                            st.caption("No text was recognised in this image.")
 
-                    st.code(
-                        "\n".join(
-                            [
-                                mrz_result.line1 or "[Line 1 not detected]",
-                                mrz_result.line2 or "[Line 2 not detected]",
-                                mrz_result.line3 or "[Line 3 not detected]",
-                            ]
-                        ),
-                        language=None,
-                    )
                     if result.notes:
                         with st.expander("Processing notes"):
                             for note in result.notes:

@@ -102,3 +102,40 @@ def test_dashboard_blocks_paths_outside_payload_root(tmp_path) -> None:
         resolve_saved_path(str(tmp_path / "secret.txt"), store)
     with pytest.raises(ValueError, match="outside"):
         resolve_saved_path("../secret.txt", store)
+
+
+@pytest.mark.parametrize(
+    ("latencies", "expected_median"),
+    [
+        ([10.0, 20.0, 30.0], 20.0),          # odd count
+        ([10.0, 20.0, 30.0, 40.0], 25.0),    # even count averages the middle
+        ([5.0], 5.0),                        # single row
+    ],
+)
+def test_summary_median_latency(tmp_path, latencies, expected_median) -> None:
+    """Median, not mean, describes a typical call.
+
+    A few large batch requests pull the mean far above what one call costs,
+    so the dashboard leads with the median.
+    """
+    store = AuditStore(tmp_path / "audit.db")
+    for latency in latencies:
+        store.record(
+            method="POST",
+            path="/v1/id-fin",
+            service="id-fin",
+            status_code=200,
+            latency_ms=latency,
+        )
+
+    summary = store.summary(hours=None)
+
+    assert summary["median_latency_ms"] == pytest.approx(expected_median)
+    assert summary["avg_latency_ms"] == pytest.approx(
+        sum(latencies) / len(latencies)
+    )
+
+
+def test_summary_median_latency_is_empty_safe(tmp_path) -> None:
+    summary = AuditStore(tmp_path / "audit.db").summary(hours=None)
+    assert summary["median_latency_ms"] == 0.0

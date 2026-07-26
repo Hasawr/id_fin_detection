@@ -551,6 +551,27 @@ class AuditStore:
                 params,
             ).fetchone()
 
+            # A handful of large batch calls drag the mean far above what a
+            # typical request costs, so report the median alongside it.
+            median_latency_ms = connection.execute(
+                f"""
+                SELECT COALESCE(AVG(latency_ms), 0) FROM (
+                    SELECT latency_ms
+                    FROM api_audit_events
+                    {where}
+                    ORDER BY latency_ms
+                    LIMIT 2 - (
+                        SELECT COUNT(*) FROM api_audit_events {where}
+                    ) % 2
+                    OFFSET (
+                        SELECT (COUNT(*) - 1) / 2
+                        FROM api_audit_events {where}
+                    )
+                )
+                """,
+                params * 3,
+            ).fetchone()[0]
+
             by_service = connection.execute(
                 f"""
                 SELECT
@@ -603,6 +624,7 @@ class AuditStore:
                 else 0.0
             ),
             "avg_latency_ms": float(totals["avg_latency_ms"]),
+            "median_latency_ms": float(median_latency_ms or 0.0),
             "by_service": [dict(row) for row in by_service],
             "by_key": [dict(row) for row in by_key],
         }
