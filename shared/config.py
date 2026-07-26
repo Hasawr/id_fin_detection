@@ -60,6 +60,14 @@ class Settings:
     audit_retention_days: int = 30
     audit_max_payload_bytes: int = 1024 * 1024 * 1024
     ocr_api_base_url: str = "http://127.0.0.1:8000"
+    ocr_worker_count: int = 1
+    ocr_concurrent_attempts: int = 1
+    # Longest side PaddleOCR resizes to for text *detection*. Measured on the
+    # benchmark fixtures: 736 reaches a valid MRZ in 22 attempts versus 32 at
+    # 960, with identical FIN accuracy, because the smaller detection map
+    # localizes the dense MRZ block more cleanly. Raise toward 960 only if
+    # small-text recall regresses on your own images.
+    ocr_det_limit_side_len: int = 736
 
 
 @lru_cache(maxsize=1)
@@ -126,6 +134,24 @@ def get_settings() -> Settings:
             os.getenv("OCR_API_BASE_URL")
             or "http://127.0.0.1:8000"
         ).rstrip("/"),
+        ocr_worker_count=_bounded_int(
+            "OCR_WORKER_COUNT",
+            1,
+            minimum=1,
+            maximum=8,
+        ),
+        ocr_concurrent_attempts=_bounded_int(
+            "OCR_CONCURRENT_ATTEMPTS",
+            1,
+            minimum=1,
+            maximum=4,
+        ),
+        ocr_det_limit_side_len=_bounded_int(
+            "OCR_DET_LIMIT_SIDE_LEN",
+            736,
+            minimum=320,
+            maximum=1920,
+        ),
     )
 
 

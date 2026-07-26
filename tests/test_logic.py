@@ -14,8 +14,7 @@ from services.id_fin.validator import (
     is_valid_fin,
     is_valid_new_card_serial,
     is_valid_old_card_serial,
-    iter_o0_variants,
-    resolve_fin_o0_ambiguity,
+    normalize_fin_o0,
 )
 from services.id_fin.mrz_extractor import MRZExtractor
 
@@ -62,34 +61,13 @@ def test_ocr_digit_confusion_and_serial_validation() -> None:
     assert not is_valid_new_card_serial("19205792")
 
 
-def test_fin_o0_variants_and_checksum_resolution() -> None:
-    assert iter_o0_variants("2BDLLON") == [
-        "2BDLLON",
-        "2BDLL0N",
-    ]
-    assert resolve_fin_o0_ambiguity("2BDLL0N") == "2BDLL0N"
-    assert (
-        resolve_fin_o0_ambiguity(
-            "2BDLL0N",
-            checksum_ok=lambda fin: fin == "2BDLLON",
-        )
-        == "2BDLLON"
-    )
-    assert (
-        resolve_fin_o0_ambiguity(
-            "2BDLLON",
-            checksum_ok=lambda fin: fin == "2BDLL0N",
-        )
-        == "2BDLL0N"
-    )
-    # Keep OCR when the composite check does not uniquely force a flip.
-    assert (
-        resolve_fin_o0_ambiguity(
-            "2BDLLON",
-            checksum_ok=lambda _fin: False,
-        )
-        == "2BDLLON"
-    )
+def test_fin_o0_normalization() -> None:
+    # Letter O never appears in a real FIN - only digit 0 does, so the
+    # correction is unconditional, unlike other OCR letter/digit mix-ups.
+    assert normalize_fin_o0("2BDLLON") == "2BDLL0N"
+    assert normalize_fin_o0("2BDLL0N") == "2BDLL0N"
+    assert not is_valid_fin("2BDLLON")
+    assert is_valid_fin(normalize_fin_o0("2BDLLON"))
 
 
 def test_td1_line2_checksums_strengthen_candidate_score() -> None:
@@ -187,7 +165,7 @@ def test_exact_new_and_old_card_mrz_layouts() -> None:
         len(line) == 30
         for line in (new_card.line1, new_card.line2, new_card.line3)
     )
-    assert old_card.fin == "2BDLLON"
+    assert old_card.fin == "2BDLL0N"
     assert old_card.card_type == "older_card"
     assert old_card.card_serial_number == "19205792"
     assert len(old_card.line1) == 36
@@ -211,19 +189,19 @@ def test_td1_checksum_corrects_ocr_digit_confusion() -> None:
     assert result.checksum_valid is True
 
 
-def test_td2_composite_checksum_fixes_fin_o0_confusion() -> None:
+def test_td2_fin_o_reading_is_always_normalized_to_zero() -> None:
     extractor = MRZExtractor.__new__(MRZExtractor)
-    # Letter O is correct (composite check digit 9); OCR read digit 0.
-    mistook_o_as_zero = "19205792<7AZE8210276M32102712BDLL0N9"
-    # Digit 0 is correct (composite check digit 5); OCR read letter O.
-    mistook_zero_as_o = "19205792<7AZE8210276M32102712BDLLON5"
+    # Real FIN never contains letter O - only digit 0. However OCR reads
+    # that character, the extracted FIN must always come out as "2BDLL0N".
+    ocr_read_digit = "19205792<7AZE8210276M32102712BDLL0N5"
+    ocr_read_letter = "19205792<7AZE8210276M32102712BDLLON5"
 
-    assert extractor._extract_td2_fields(mistook_o_as_zero)["fin"] == "2BDLLON"
-    assert extractor._extract_td2_fields(mistook_zero_as_o)["fin"] == "2BDLL0N"
-    assert extractor._extract_td2_fields(mistook_o_as_zero)[
+    assert extractor._extract_td2_fields(ocr_read_digit)["fin"] == "2BDLL0N"
+    assert extractor._extract_td2_fields(ocr_read_letter)["fin"] == "2BDLL0N"
+    assert extractor._extract_td2_fields(ocr_read_digit)[
         "composite_checksum_valid"
     ]
-    assert extractor._extract_td2_fields(mistook_zero_as_o)[
+    assert extractor._extract_td2_fields(ocr_read_letter)[
         "composite_checksum_valid"
     ]
 
@@ -421,7 +399,7 @@ def test_td2_can_use_structural_second_line_when_header_is_lost() -> None:
 
     assert pair is not None
     result = _parse_td2_for_test(extractor, pair, is_cropped=False)
-    assert result.fin == "2BDLLON"
+    assert result.fin == "2BDLL0N"
     assert result.card_serial_number == "19205792"
     assert result.card_type == "older_card"
 
@@ -438,7 +416,7 @@ def test_older_card_fin_recovers_when_aze_alignment_shifts() -> None:
         is_cropped=False,
     )
 
-    assert result.fin == "2BDLLON"
+    assert result.fin == "2BDLL0N"
     assert result.card_type == "older_card"
     assert result.card_serial_number == "19205792"
 
@@ -454,7 +432,7 @@ def test_older_card_tolerates_digit_confusion_in_birth_date() -> None:
         is_cropped=False,
     )
 
-    assert result.fin == "2BDLLON"
+    assert result.fin == "2BDLL0N"
     assert result.card_type == "older_card"
     assert result.card_serial_number == "19205792"
 
@@ -470,7 +448,7 @@ def test_older_card_serial_corrects_ocr_digit_confusion() -> None:
         is_cropped=False,
     )
 
-    assert result.fin == "2BDLLON"
+    assert result.fin == "2BDLL0N"
     assert result.card_serial_number == "19205792"
     assert result.checksum_valid is True
 

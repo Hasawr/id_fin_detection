@@ -1,3 +1,4 @@
+import html
 import sys
 import time
 from pathlib import Path
@@ -28,9 +29,29 @@ st.set_page_config(page_title="OCR Demo", layout="wide")
 st.markdown(
     """
     <style>
+      :root {
+        --ocr-success-bg: #e8f6ee;
+        --ocr-success-fg: #146c2e;
+        --ocr-error-bg: #fdecea;
+        --ocr-error-fg: #b3261e;
+        --ocr-muted: #6b7280;
+        --ocr-border: rgba(49, 51, 63, 0.15);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --ocr-success-bg: rgba(34, 197, 94, 0.16);
+          --ocr-success-fg: #4ade80;
+          --ocr-error-bg: rgba(239, 68, 68, 0.16);
+          --ocr-error-fg: #f87171;
+          --ocr-muted: #9aa1ac;
+          --ocr-border: rgba(250, 250, 250, 0.15);
+        }
+      }
       [data-testid="stSidebar"] { display: none; }
       [data-testid="stSidebarCollapsedControl"] { display: none; }
-      .block-container { padding-top: 1.25rem; padding-bottom: 2rem; }
+      /* Streamlit's own header toolbar is position:absolute, ~60px tall,
+         and overlaps whatever sits at the very top of .block-container. */
+      .block-container { padding-top: 4.5rem; padding-bottom: 2rem; }
       h1, h2, h3 { margin-top: 0.2rem; margin-bottom: 0.35rem; }
       div[data-testid="stVerticalBlockBorderWrapper"] [data-testid="stImage"] {
         max-width: 240px;
@@ -54,12 +75,38 @@ st.markdown(
         white-space: nowrap;
       }
       .demo-status-ok {
-        background: #e8f6ee;
-        color: #146c2e;
+        background: var(--ocr-success-bg);
+        color: var(--ocr-success-fg);
       }
       .demo-status-bad {
-        background: #fff4e5;
-        color: #9a5b00;
+        background: var(--ocr-error-bg);
+        color: var(--ocr-error-fg);
+      }
+      .ocr-result-header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.5rem 1.5rem;
+        padding-bottom: 0.6rem;
+        margin-bottom: 0.6rem;
+        border-bottom: 1px solid var(--ocr-border);
+      }
+      .ocr-result-header .ocr-field {
+        display: flex;
+        flex-direction: column;
+        gap: 0.05rem;
+        min-width: 4.5rem;
+      }
+      .ocr-result-header .ocr-field-label {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ocr-muted);
+      }
+      .ocr-result-header .ocr-field-value {
+        font-size: 1.05rem;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
       }
     </style>
     """,
@@ -320,21 +367,22 @@ def render_id_fin_demo() -> None:
     )
 
     st.subheader("Detailed results")
-    card_filter_column, status_filter_column = st.columns(2)
-    with card_filter_column:
-        card_filter = st.segmented_control(
-            "Card type",
-            options=["All", "New", "Older", "Unknown"],
-            default="All",
-            key="card_type_filter",
-        ) or "All"
-    with status_filter_column:
-        status_filter = st.segmented_control(
-            "Detection status",
-            options=["All", "Detected", "Not detected"],
-            default="All",
-            key="detection_status_filter",
-        ) or "All"
+    with st.container(border=True):
+        card_filter_column, status_filter_column = st.columns(2)
+        with card_filter_column:
+            card_filter = st.segmented_control(
+                "Card type",
+                options=["All", "New", "Older", "Unknown"],
+                default="All",
+                key="card_type_filter",
+            ) or "All"
+        with status_filter_column:
+            status_filter = st.segmented_control(
+                "Detection status",
+                options=["All", "Detected", "Not detected"],
+                default="All",
+                key="detection_status_filter",
+            ) or "All"
 
     card_type_filters = {
         "New": "new_card",
@@ -426,35 +474,61 @@ def render_id_fin_demo() -> None:
                     st.caption("Re-upload to show preview.")
 
             with result_column:
-                if has_processing_error(result):
+                mrz_result = result.mrz_details
+                is_error = has_processing_error(result)
+                status_kind = "ok" if (result.fin and not is_error) else "bad"
+                status_label = (
+                    "Processing error"
+                    if is_error
+                    else ("FIN detected" if result.fin else "Not detected")
+                )
+                serial_value = (
+                    mrz_result.card_serial_number
+                    if mrz_result is not None and mrz_result.card_serial_number
+                    else "—"
+                )
+                st.markdown(
+                    f"""
+                    <div class="ocr-result-header">
+                      <span class="demo-status demo-status-{status_kind}">
+                        {html.escape(status_label)}
+                      </span>
+                      <div class="ocr-field">
+                        <span class="ocr-field-label">FIN</span>
+                        <span class="ocr-field-value">
+                          {html.escape(result.fin or "Not found")}
+                        </span>
+                      </div>
+                      <div class="ocr-field">
+                        <span class="ocr-field-label">Card serial</span>
+                        <span class="ocr-field-value">
+                          {html.escape(serial_value)}
+                        </span>
+                      </div>
+                      <div class="ocr-field">
+                        <span class="ocr-field-label">Confidence</span>
+                        <span class="ocr-field-value">
+                          {result.confidence:.1%}
+                        </span>
+                      </div>
+                      <div class="ocr-field">
+                        <span class="ocr-field-label">Time</span>
+                        <span class="ocr-field-value">{elapsed:.2f}s</span>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                if is_error:
                     st.error(result.notes[-1])
-                elif result.fin:
-                    st.success("MRZ and FIN detected")
-                else:
+                elif not result.fin:
                     failure_message = (
                         result.notes[-1]
                         if result.notes
                         else "MRZ or FIN was not detected."
                     )
                     st.error(failure_message)
-
-                fin_col, serial_col = st.columns(2)
-                with fin_col:
-                    st.metric("FIN", result.fin or "Not found")
-                mrz_result = result.mrz_details
-                with serial_col:
-                    serial_value = (
-                        mrz_result.card_serial_number
-                        if mrz_result is not None
-                        and mrz_result.card_serial_number
-                        else "—"
-                    )
-                    st.metric("Card serial number", serial_value)
-
-                st.caption(
-                    f"Confidence: {result.confidence:.2%} · "
-                    f"This image: {elapsed:.2f}s"
-                )
 
                 if mrz_result is not None:
                     if mrz_result.card_type == "new_card":

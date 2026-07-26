@@ -1,4 +1,5 @@
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib import import_module
 import logging
@@ -45,6 +46,28 @@ def configure_nvidia_dll_directories() -> None:
     )
 
 
+# Paddle reads these once, at import time, so they must be set before the
+# first `import paddle` anywhere in the process.
+PADDLE_ALLOCATOR_DEFAULTS = {
+    # Grow the GPU pool on demand instead of Paddle's default attempt to
+    # reserve ~92% of the card up front. On a machine whose GPU also drives
+    # the display there may only be a couple of spare GiB, and the up-front
+    # reservation leaves the pool thrashing on every new allocation.
+    "FLAGS_allocator_strategy": "auto_growth",
+    # Grow in 1 GiB steps. Each growth is a blocking cudaMalloc that costs
+    # roughly a second under memory pressure, so fewer, larger steps beat
+    # many small ones.
+    "FLAGS_initial_gpu_memory_in_mb": "1024",
+    "FLAGS_reallocate_gpu_memory_in_mb": "1024",
+}
+
+
+def configure_paddle_allocator() -> None:
+    """Apply GPU allocator defaults, leaving any operator override intact."""
+    for flag, value in PADDLE_ALLOCATOR_DEFAULTS.items():
+        os.environ.setdefault(flag, value)
+
+
 class FINDetector:
     HIGH_CONFIDENCE_ACCEPT = 0.90
     RECTIFIED_FAIL_FAST_ATTEMPTS = 3
@@ -69,10 +92,12 @@ class FINDetector:
         use_gpu: bool = True,
         save_debug_images: bool = False,
         max_ocr_side: int = ImagePreprocessor.DEFAULT_MAX_OCR_SIDE,
-        det_limit_side_len: int = 960,
+        det_limit_side_len: int = 736,
+        concurrent_attempts: int = 1,
     ):
         if use_gpu:
             configure_nvidia_dll_directories()
+            configure_paddle_allocator()
 
         import paddle
         from paddleocr import PaddleOCR
@@ -84,22 +109,45 @@ class FINDetector:
             )
 
         logger.info(
-            "Initializing FINDetector (use_gpu=%s, save_debug_images=%s)",
+            "Initializing FINDetector (use_gpu=%s, save_debug_images=%s, "
+            "concurrent_attempts=%d)",
             use_gpu,
             save_debug_images,
+            concurrent_attempts,
         )
-        ocr_engine = PaddleOCR(
-            use_angle_cls=False,
-            lang="en",
-            show_log=False,
-            use_gpu=use_gpu,
-            max_text_length=40,
-            det_limit_side_len=det_limit_side_len,
-            det_limit_type="max",
-            ocr_version=PRODUCTION_OCR_VERSION,
-        )
+
+        def build_engine() -> "PaddleOCR":
+            return PaddleOCR(
+                use_angle_cls=False,
+                lang="en",
+                show_log=False,
+                use_gpu=use_gpu,
+                max_text_length=40,
+                det_limit_side_len=det_limit_side_len,
+                det_limit_type="max",
+                ocr_version=PRODUCTION_OCR_VERSION,
+            )
+
         self.preprocessor = ImagePreprocessor()
-        self.mrz_extractor = MRZExtractor(ocr_engine)
+        self.mrz_extractor = MRZExtractor(build_engine())
+        # Extra engines let independent attempts within a single image run
+        # concurrently instead of strictly one at a time. This trades some
+        # redundant GPU/CPU compute (an attempt may still run even though an
+        # earlier concurrent one already made it unnecessary) for lower
+        # wall-clock detection latency. Defaults to 1 engine, which keeps
+        # the original strictly-sequential behavior unchanged.
+        extra_engine_count = max(0, concurrent_attempts - 1)
+        self._extractor_pool = [self.mrz_extractor] + [
+            MRZExtractor(build_engine()) for _ in range(extra_engine_count)
+        ]
+        self._attempt_executor = (
+            ThreadPoolExecutor(
+                max_workers=len(self._extractor_pool),
+                thread_name_prefix="id-fin-attempt",
+            )
+            if extra_engine_count
+            else None
+        )
         self.save_debug_images = save_debug_images
         self.max_ocr_side = max_ocr_side
 
@@ -118,66 +166,15 @@ class FINDetector:
             attempted_results = []
             valid_results = []
             roi_applied = rectified is not image
-            failed_rectified_attempts = 0
 
-            for attempt in attempts:
-                fin_counts = Counter(
-                    result.fin for result in valid_results if result.fin
-                )
-                has_conflict = len(fin_counts) > 1
-                strongest_consensus = max(
-                    fin_counts.values(),
-                    default=0,
-                )
-                if (
-                    attempt.name in self.RECOVERY_ATTEMPTS
-                    and strongest_consensus >= 2
-                    and not has_conflict
-                ):
-                    break
-                attempt_image = attempt.image_factory()
-                if attempt_image is None:
-                    continue
-                attempt_started = time.perf_counter()
-                attempted_result = self.mrz_extractor.extract(
-                    attempt_image,
-                    attempt=attempt.name,
-                )
-                attempt_seconds = time.perf_counter() - attempt_started
-                notes.append(
-                    f"OCR attempt {attempt.name}: "
-                    f"{attempt_seconds:.4f}s."
-                )
-                logger.info(
-                    "OCR attempt %s for %s completed in %.4fs",
-                    attempt.name,
-                    image_path.name,
-                    attempt_seconds,
-                )
-                attempted_results.append(attempted_result)
-                if self.mrz_extractor.is_structurally_valid(
-                    attempted_result
-                ):
-                    valid_results.append(attempted_result)
-                    if self._should_stop_after_valid_result(
-                        attempted_result,
-                        valid_results,
-                        notes,
-                        attempt_name=attempt.name,
-                    ):
-                        break
-                elif roi_applied and not valid_results:
-                    failed_rectified_attempts += 1
-                    if (
-                        failed_rectified_attempts
-                        >= self.RECTIFIED_FAIL_FAST_ATTEMPTS
-                    ):
-                        notes.append(
-                            "Rectified crop produced no MRZ after "
-                            f"{self.RECTIFIED_FAIL_FAST_ATTEMPTS} attempts; "
-                            "trying original image."
-                        )
-                        break
+            self._run_attempt_cascade(
+                attempts,
+                attempted_results=attempted_results,
+                valid_results=valid_results,
+                notes=notes,
+                image_path=image_path,
+                roi_applied=roi_applied,
+            )
 
             if not valid_results and roi_applied:
                 for attempt in self._build_attempts(image):
@@ -249,6 +246,142 @@ class FINDetector:
             raise OCRProcessingError(
                 f"Failed to process MRZ image {image_path.name}."
             ) from exc
+
+    def _run_attempt_cascade(
+        self,
+        attempts: list[OCRAttempt],
+        *,
+        attempted_results: list,
+        valid_results: list,
+        notes: list[str],
+        image_path: Path,
+        roi_applied: bool,
+    ) -> None:
+        """Runs the primary attempt cascade, stopping early on consensus or
+        high confidence exactly as a single-attempt-at-a-time loop would.
+
+        When extra OCR engines are configured (``concurrent_attempts`` on
+        __init__), independent attempts run concurrently in small batches
+        instead of strictly one at a time: each batch is dispatched using
+        the consensus/validity state as of the start of that batch, so an
+        attempt may occasionally run even though an earlier attempt in the
+        same batch already made it unnecessary. That's an intentional
+        trade of some redundant compute for lower wall-clock latency; at
+        the default of one engine, batches are always size 1 and behavior
+        is identical to the original sequential loop.
+        """
+        extractor_pool = getattr(self, "_extractor_pool", None) or [
+            self.mrz_extractor
+        ]
+        executor = getattr(self, "_attempt_executor", None)
+        batch_size = len(extractor_pool) if executor is not None else 1
+
+        failed_rectified_attempts = 0
+        index = 0
+        total = len(attempts)
+
+        while index < total:
+            fin_counts = Counter(
+                result.fin for result in valid_results if result.fin
+            )
+            has_conflict = len(fin_counts) > 1
+            strongest_consensus = max(fin_counts.values(), default=0)
+
+            batch: list[OCRAttempt] = []
+            cascade_done = False
+            while len(batch) < batch_size and index < total:
+                attempt = attempts[index]
+                if (
+                    attempt.name in self.RECOVERY_ATTEMPTS
+                    and strongest_consensus >= 2
+                    and not has_conflict
+                ):
+                    cascade_done = True
+                    break
+                index += 1
+                batch.append(attempt)
+
+            prepared = [
+                (attempt, attempt.image_factory()) for attempt in batch
+            ]
+            prepared = [
+                (attempt, attempt_image)
+                for attempt, attempt_image in prepared
+                if attempt_image is not None
+            ]
+
+            if not prepared:
+                if cascade_done:
+                    return
+                continue
+
+            if len(prepared) == 1 or executor is None:
+                timed_results = [
+                    self._time_attempt(extractor_pool[0], attempt, attempt_image)
+                    for attempt, attempt_image in prepared
+                ]
+            else:
+                futures = [
+                    executor.submit(
+                        self._time_attempt,
+                        extractor_pool[position % len(extractor_pool)],
+                        attempt,
+                        attempt_image,
+                    )
+                    for position, (attempt, attempt_image) in enumerate(
+                        prepared
+                    )
+                ]
+                timed_results = [future.result() for future in futures]
+
+            for attempt, attempted_result, attempt_seconds in timed_results:
+                notes.append(
+                    f"OCR attempt {attempt.name}: "
+                    f"{attempt_seconds:.4f}s."
+                )
+                logger.info(
+                    "OCR attempt %s for %s completed in %.4fs",
+                    attempt.name,
+                    image_path.name,
+                    attempt_seconds,
+                )
+                attempted_results.append(attempted_result)
+                if self.mrz_extractor.is_structurally_valid(
+                    attempted_result
+                ):
+                    valid_results.append(attempted_result)
+                    if self._should_stop_after_valid_result(
+                        attempted_result,
+                        valid_results,
+                        notes,
+                        attempt_name=attempt.name,
+                    ):
+                        return
+                elif roi_applied and not valid_results:
+                    failed_rectified_attempts += 1
+                    if (
+                        failed_rectified_attempts
+                        >= self.RECTIFIED_FAIL_FAST_ATTEMPTS
+                    ):
+                        notes.append(
+                            "Rectified crop produced no MRZ after "
+                            f"{self.RECTIFIED_FAIL_FAST_ATTEMPTS} attempts; "
+                            "trying original image."
+                        )
+                        return
+
+            if cascade_done:
+                return
+
+    @staticmethod
+    def _time_attempt(
+        extractor,
+        attempt: OCRAttempt,
+        attempt_image,
+    ) -> tuple[OCRAttempt, object, float]:
+        attempt_started = time.perf_counter()
+        result = extractor.extract(attempt_image, attempt=attempt.name)
+        return attempt, result, time.perf_counter() - attempt_started
 
     def _finalize_detection(
         self,
@@ -356,6 +489,8 @@ class FINDetector:
 
     def _build_attempts(self, rectified) -> list[OCRAttempt]:
         deskewed_cache: dict[str, object] = {}
+        mrz_roi_cache: dict[int, object] = {}
+        deskewed_strip_cache: dict[float, object] = {}
 
         def prepare_crop(
             image,
@@ -373,7 +508,15 @@ class FINDetector:
             )
 
         def get_mrz_roi(source, *, binarize: bool = False):
-            mrz_roi = self.preprocessor.detect_mrz_roi(source)
+            # Keyed by identity: the same source (rectified or deskewed) is
+            # passed in twice across the plain/binarized attempt pair, and
+            # ROI detection (contours/Sobel/morphology) is expensive to redo.
+            source_key = id(source)
+            if source_key not in mrz_roi_cache:
+                mrz_roi_cache[source_key] = self.preprocessor.detect_mrz_roi(
+                    source
+                )
+            mrz_roi = mrz_roi_cache[source_key]
             if mrz_roi is None:
                 return None
             return prepare_crop(mrz_roi, binarize=binarize)
@@ -392,12 +535,19 @@ class FINDetector:
             return prepare_crop(strip, binarize=binarize)
 
         def get_deskewed_strip(ratio: float, *, binarize: bool = False):
-            strip = self.preprocessor.crop_mrz_strip(
-                rectified,
-                height_ratio=ratio,
-            )
-            deskewed = self.preprocessor.deskew_mrz_strip(strip)
-            if deskewed is strip:
+            # Same rationale as get_mrz_roi: the plain/binarized attempt
+            # pair shares the same Hough-transform deskew of one strip crop.
+            if ratio not in deskewed_strip_cache:
+                strip = self.preprocessor.crop_mrz_strip(
+                    rectified,
+                    height_ratio=ratio,
+                )
+                deskewed = self.preprocessor.deskew_mrz_strip(strip)
+                deskewed_strip_cache[ratio] = (
+                    None if deskewed is strip else deskewed
+                )
+            deskewed = deskewed_strip_cache[ratio]
+            if deskewed is None:
                 return None
             return prepare_crop(
                 deskewed,
@@ -418,6 +568,15 @@ class FINDetector:
                 self.max_ocr_side,
             )
 
+        # Ordered by measured yield-per-cost on the benchmark fixtures and on
+        # recorded production traffic, cheapest high-yield first:
+        #   - the plain MRZ strip resolves the large majority of images alone;
+        #   - full_image is the single highest-yield fallback, so it runs
+        #     early rather than after every crop variant has been tried. It is
+        #     only expensive when the GPU pool is thrashing, which
+        #     configure_paddle_allocator() addresses;
+        #   - mrz_roi and the binarized/deskewed variants are low-yield
+        #     rescues for awkward crops, so they run last.
         return [
             OCRAttempt(
                 name="mrz_strip",
@@ -426,13 +585,16 @@ class FINDetector:
                 ),
             ),
             OCRAttempt(
-                name="mrz_roi",
-                image_factory=lambda: get_mrz_roi(rectified),
-            ),
-            OCRAttempt(
                 name="mrz_strip_wide",
                 image_factory=lambda: get_strip(
                     self.preprocessor.MRZ_HEIGHT_RATIO_WIDE
+                ),
+            ),
+            OCRAttempt(
+                name="full_image",
+                image_factory=lambda: self.preprocessor.bound_ocr_input(
+                    rectified,
+                    self.max_ocr_side,
                 ),
             ),
             OCRAttempt(
@@ -440,6 +602,10 @@ class FINDetector:
                 image_factory=lambda: get_strip(
                     self.preprocessor.MRZ_HEIGHT_RATIO_TIGHT
                 ),
+            ),
+            OCRAttempt(
+                name="mrz_roi",
+                image_factory=lambda: get_mrz_roi(rectified),
             ),
             OCRAttempt(
                 name="mrz_strip_binarized",
@@ -451,10 +617,6 @@ class FINDetector:
             OCRAttempt(
                 name="mrz_roi_binarized",
                 image_factory=lambda: get_mrz_roi(rectified, binarize=True),
-            ),
-            OCRAttempt(
-                name="deskewed_mrz_roi",
-                image_factory=lambda: get_deskewed_mrz_roi(),
             ),
             OCRAttempt(
                 name="deskewed_mrz_strip",
@@ -470,11 +632,8 @@ class FINDetector:
                 ),
             ),
             OCRAttempt(
-                name="full_image",
-                image_factory=lambda: self.preprocessor.bound_ocr_input(
-                    rectified,
-                    self.max_ocr_side,
-                ),
+                name="deskewed_mrz_roi",
+                image_factory=lambda: get_deskewed_mrz_roi(),
             ),
             OCRAttempt(
                 name="deskewed_full_image",

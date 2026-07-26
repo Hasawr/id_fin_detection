@@ -26,6 +26,7 @@ from shared.config import get_settings
 
 AUDIT_SCHEMA_VERSION = 2
 PAGE_SIZE = 8
+EVENT_FETCH_LIMIT = 200
 
 @st.cache_resource
 def load_store(_schema_version: int) -> AuditStore:
@@ -161,25 +162,74 @@ def render_kpis(summary: dict) -> None:
 
 def render_breakdown(summary: dict, labels: dict[str, str]) -> None:
     chips: list[str] = []
-    for row in summary.get("by_service") or []:
-        name = html.escape(str(row["name"] or "unknown"))
-        chips.append(
-            f'<div class="breakdown-item"><div class="name">{name}</div>'
-            f'<div class="meta">{row["total"]} calls · {row["ocr_detected"]} detected · '
-            f'{row["failed"]} failed</div></div>'
-        )
-    for row in summary.get("by_key") or []:
-        name = html.escape(client_label(row["fingerprint"], labels))
-        chips.append(
-            f'<div class="breakdown-item"><div class="name">{name}</div>'
-            f'<div class="meta">{row["total"]} calls · {row["ocr_detected"]} detected · '
-            f'{row["failed"]} failed</div></div>'
-        )
+    by_service = summary.get("by_service") or []
+    by_key = summary.get("by_key") or []
+    # A single service or a single client just restates the KPI row above,
+    # so only render a breakdown group when it actually distinguishes calls.
+    if len(by_service) > 1:
+        for row in by_service:
+            name = html.escape(str(row["name"] or "unknown"))
+            chips.append(
+                f'<div class="breakdown-item"><div class="name">{name}</div>'
+                f'<div class="meta">{row["total"]} calls · {row["ocr_detected"]} detected · '
+                f'{row["failed"]} failed</div></div>'
+            )
+    if len(by_key) > 1:
+        for row in by_key:
+            name = html.escape(client_label(row["fingerprint"], labels))
+            chips.append(
+                f'<div class="breakdown-item"><div class="name">{name}</div>'
+                f'<div class="meta">{row["total"]} calls · {row["ocr_detected"]} detected · '
+                f'{row["failed"]} failed</div></div>'
+            )
     if chips:
         st.markdown(
             '<div class="breakdown">' + "".join(chips) + "</div>",
             unsafe_allow_html=True,
         )
+
+
+@st.dialog("Clear all audit data")
+def render_clear_all_dialog(store: AuditStore) -> None:
+    all_time_total = store.summary(hours=None)["total"]
+    payload_bytes = sum(
+        path.stat().st_size
+        for path in store.payload_dir.rglob("*")
+        if path.is_file()
+    )
+    st.warning(
+        "This permanently deletes every recorded API call and every saved "
+        "request file on disk. This cannot be undone."
+    )
+    st.caption(
+        f"{all_time_total} call(s) recorded · "
+        f"{payload_bytes / (1024 * 1024):.1f} MB of saved payloads"
+    )
+    confirm_text = st.text_input(
+        'Type "DELETE" to confirm',
+        key="audit_clear_confirm_text",
+    )
+    cancel_col, confirm_col = st.columns(2)
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with confirm_col:
+        if st.button(
+            "Delete everything",
+            type="primary",
+            use_container_width=True,
+            disabled=confirm_text.strip() != "DELETE",
+        ):
+            result = store.clear_all()
+            load_store.clear()
+            st.session_state.pop("audit_selected_id", None)
+            st.session_state.pop("audit_list_page", None)
+            st.session_state.pop("audit_clear_confirm_text", None)
+            st.session_state["audit_clear_toast"] = (
+                f"Cleared {result['events']} call(s) and "
+                f"{result['payload_directories']} payload folder(s)."
+            )
+            st.rerun()
 
 
 
@@ -322,43 +372,41 @@ def render_integration_audit() -> None:
         for index, api_key in enumerate(settings.api_keys)
     }
 
+    toast_message = st.session_state.pop("audit_clear_toast", None)
+    if toast_message:
+        st.toast(toast_message, icon="✅")
+
     # --- Header ---
-    title_col, action_col = st.columns([4, 1], vertical_alignment="bottom")
+    title_col, refresh_col, clear_col = st.columns(
+        [3.5, 0.85, 0.95], vertical_alignment="bottom"
+    )
     with title_col:
         st.markdown("## Integration audit")
         st.caption("Who called the OCR API, what they sent, and what came back.")
-    with action_col:
+    with refresh_col:
         if st.button("Refresh", type="primary", use_container_width=True):
             load_store.clear()
             st.rerun()
+    with clear_col:
+        if st.button("Clear data", use_container_width=True):
+            render_clear_all_dialog(store)
 
     # --- Filters (top bar, not buried) ---
-    f1, f2, f3, f4 = st.columns([1.3, 1.8, 1.2, 1.2])
-    with f1:
-        window_label = st.selectbox(
-            "Time window",
-            ["Last 1 hour", "Last 24 hours", "Last 7 days", "All time"],
-            index=1,
-        )
-    with f2:
-        outcome = st.segmented_control(
-            "Outcome",
-            options=["All", "Detected", "Not found", "Failed"],
-            default="All",
-            key="audit_outcome",
-        ) or "All"
-    with f3:
-        event_limit = st.select_slider(
-            "Show last",
-            options=[25, 50, 100, 200, 500],
-            value=100,
-        )
-    with f4:
-        search = st.text_input(
-            "Search",
-            placeholder="FIN, serial, client…",
-            label_visibility="visible",
-        )
+    with st.container(border=True):
+        f1, f2 = st.columns([1, 1.6])
+        with f1:
+            window_label = st.selectbox(
+                "Time window",
+                ["Last 1 hour", "Last 24 hours", "Last 7 days", "All time"],
+                index=1,
+            )
+        with f2:
+            outcome = st.segmented_control(
+                "Outcome",
+                options=["All", "Detected", "Not found", "Failed"],
+                default="All",
+                key="audit_outcome",
+            ) or "All"
 
     hours = {
         "Last 1 hour": 1,
@@ -371,9 +419,9 @@ def render_integration_audit() -> None:
     summary = store.summary(hours=hours)
     is_ocr_filter = outcome in {"Detected", "Not found"}
     fetch_limit = (
-        min(max(event_limit * 10, 500), 2000)
-        if is_ocr_filter or search.strip()
-        else event_limit
+        min(max(EVENT_FETCH_LIMIT * 10, 500), 2000)
+        if is_ocr_filter
+        else EVENT_FETCH_LIMIT
     )
     events = store.recent_events(limit=fetch_limit, hours=hours, success=success_filter)
 
@@ -382,34 +430,15 @@ def render_integration_audit() -> None:
             event
             for event in events
             if ocr_outcome_counts(event.response_body)[0] > 0
-        ][:event_limit]
+        ][:EVENT_FETCH_LIMIT]
     elif outcome == "Not found":
         events = [
             event
             for event in events
             if ocr_outcome_counts(event.response_body)[1] > 0
-        ][:event_limit]
+        ][:EVENT_FETCH_LIMIT]
     else:
-        events = events[:event_limit]
-
-    query = search.strip().lower()
-    if query:
-        filtered: list[AuditEvent] = []
-        for event in events:
-            haystack = " ".join(
-                [
-                    str(event.id),
-                    event.result_summary or "",
-                    client_label(event.api_key_fingerprint, labels),
-                    event.path or "",
-                    event.service or "",
-                    event.error_code or "",
-                    result_badge(event),
-                ]
-            ).lower()
-            if query in haystack:
-                filtered.append(event)
-        events = filtered
+        events = events[:EVENT_FETCH_LIMIT]
 
     render_kpis(summary)
     render_breakdown(summary, labels)
@@ -419,11 +448,11 @@ def render_integration_audit() -> None:
     )
 
     if not events:
-        st.info("No API calls match these filters yet. Try widening the time window or clearing search.")
+        st.info("No API calls match these filters yet. Try widening the time window.")
         return
 
     # --- Selection + pagination state ---
-    filter_key = (window_label, outcome, event_limit, query)
+    filter_key = (window_label, outcome)
     if st.session_state.get("audit_filter_key") != filter_key:
         st.session_state["audit_filter_key"] = filter_key
         st.session_state["audit_list_page"] = 0

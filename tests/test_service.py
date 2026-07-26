@@ -1,6 +1,6 @@
 import asyncio
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import pytest
 
@@ -181,3 +181,120 @@ def test_service_close_drains_in_flight_work(monkeypatch) -> None:
 
     result = asyncio.run(run_scenario())
     assert result.fin == "active"
+
+
+def test_multi_worker_pool_creates_n_detectors_and_round_robins(
+    monkeypatch,
+) -> None:
+    from services.id_fin import service as service_module
+
+    created_detectors: list[object] = []
+
+    class FakeSettings:
+        use_gpu = False
+        save_ocr_debug_images = False
+        ocr_worker_count = 2
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self.index = len(created_detectors)
+            created_detectors.append(self)
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            return FINDetectionOutput(
+                fin=f"{self.index}:{image_path.name}",
+                confidence=0.9,
+            )
+
+    monkeypatch.setattr(service_module, "FINDetector", FakeDetector)
+    service = service_module.IDFinService(settings=FakeSettings())
+
+    assert len(created_detectors) == 2
+
+    results = asyncio.run(
+        service.process_many(
+            image_paths=[Path(f"{n}.png") for n in range(4)]
+        )
+    )
+    assert [item["fin"] for item in results] == [
+        "0:0.png",
+        "1:1.png",
+        "0:2.png",
+        "1:3.png",
+    ]
+    service.close()
+
+
+def test_multi_worker_pool_processes_images_concurrently(monkeypatch) -> None:
+    from services.id_fin import service as service_module
+
+    both_entered = Event()
+    release = Event()
+    entered_count = {"n": 0}
+    counter_lock = Lock()
+
+    class FakeSettings:
+        use_gpu = False
+        save_ocr_debug_images = False
+        ocr_worker_count = 2
+
+    class BlockingDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            with counter_lock:
+                entered_count["n"] += 1
+                if entered_count["n"] == 2:
+                    both_entered.set()
+            # Both engines must reach this point before either proceeds,
+            # proving they ran concurrently rather than one-at-a-time.
+            assert both_entered.wait(timeout=2)
+            assert release.wait(timeout=2)
+            return FINDetectionOutput(fin=image_path.stem, confidence=0.9)
+
+    monkeypatch.setattr(service_module, "FINDetector", BlockingDetector)
+    service = service_module.IDFinService(settings=FakeSettings())
+
+    async def run_scenario() -> list[dict[str, object]]:
+        task = asyncio.create_task(
+            service.process_many(
+                image_paths=[Path("a.png"), Path("b.png")]
+            )
+        )
+        assert await asyncio.to_thread(both_entered.wait, 1)
+        release.set()
+        return await task
+
+    results = asyncio.run(run_scenario())
+    assert {item["fin"] for item in results} == {"a", "b"}
+    service.close()
+
+
+def test_single_worker_pool_stays_default_when_setting_missing(
+    monkeypatch,
+) -> None:
+    from services.id_fin import service as service_module
+
+    created_detectors: list[object] = []
+
+    class FakeSettingsWithoutWorkerCount:
+        use_gpu = False
+        save_ocr_debug_images = False
+
+    class FakeDetector:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            created_detectors.append(self)
+
+        def detect_from_mrz(self, image_path: Path) -> FINDetectionOutput:
+            return FINDetectionOutput(fin=image_path.stem, confidence=0.9)
+
+    monkeypatch.setattr(service_module, "FINDetector", FakeDetector)
+    service = service_module.IDFinService(
+        settings=FakeSettingsWithoutWorkerCount()
+    )
+
+    assert len(created_detectors) == 1
+    service.close()

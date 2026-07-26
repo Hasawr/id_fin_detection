@@ -19,6 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.id_fin.detector import FINDetector, PRODUCTION_OCR_VERSION
+from shared.config import get_settings
 
 
 ATTEMPT_TIMING_PATTERN = re.compile(
@@ -36,7 +37,13 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--min-improvement", type=float, default=0.20)
     parser.add_argument("--ocr-max-side", type=int, default=1600)
-    parser.add_argument("--det-limit-side-len", type=int, default=960)
+    # Default to the production setting so the benchmark measures what the
+    # service actually runs, rather than a number that drifts away from it.
+    parser.add_argument(
+        "--det-limit-side-len",
+        type=int,
+        default=get_settings().ocr_det_limit_side_len,
+    )
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument(
         "--stress",

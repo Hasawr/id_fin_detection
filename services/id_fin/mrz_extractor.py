@@ -25,7 +25,7 @@ from .validator import (
     compute_mrz_check_digit,
     correct_ocr_digits,
     is_valid_fin,
-    resolve_fin_o0_ambiguity,
+    normalize_fin_o0,
     is_valid_new_card_serial,
     is_valid_old_card_serial,
 )
@@ -415,9 +415,9 @@ class MRZExtractor:
             else nationality_index + TD2_FIN_AFTER_NATIONALITY
         )
         fin = cls._recover_td2_fin(normalized, fin_start)
-        canonical_fin = normalized[
-            fin_start : fin_start + TD2_FIN.length
-        ]
+        canonical_fin = normalize_fin_o0(
+            normalized[fin_start : fin_start + TD2_FIN.length]
+        )
         if fin is not None and fin_start >= 0:
             normalized = (
                 normalized[:fin_start]
@@ -454,32 +454,12 @@ class MRZExtractor:
         )
 
     @classmethod
-    def _td2_composite_valid_with_fin(
-        cls,
-        line2: str,
-        fin_start: int,
-        fin: str,
-    ) -> bool:
-        normalized = cls._normalize_length(line2, TD2_LINE_LENGTH)
-        if fin_start < 0 or fin_start + TD2_FIN.length > len(normalized):
-            return False
-        spliced = (
-            normalized[:fin_start]
-            + fin
-            + normalized[fin_start + TD2_FIN.length :]
-        )
-        return cls._td2_composite_checksum_valid(spliced)
-
-    @classmethod
     def _recover_td2_fin(cls, line2: str, expected_start: int) -> str | None:
         """Prefer the fixed FIN window, then nearby offsets with a check digit."""
-        windows: list[tuple[int, str]] = []
+        windows: list[str] = []
         if expected_start >= 0 and expected_start + TD2_FIN.length <= len(line2):
             windows.append(
-                (
-                    expected_start,
-                    line2[expected_start : expected_start + TD2_FIN.length],
-                )
+                line2[expected_start : expected_start + TD2_FIN.length]
             )
 
         # Offset recovery only when a trailing check digit is present. This
@@ -490,17 +470,12 @@ class MRZExtractor:
                 continue
             value = line2[start : start + TD2_FIN.length]
             if line2[start + TD2_FIN.length].isdigit():
-                windows.append((start, value))
+                windows.append(value)
 
-        for start, window in windows:
-            resolved = resolve_fin_o0_ambiguity(
-                window,
-                checksum_ok=lambda fin, fin_start=start: (
-                    cls._td2_composite_valid_with_fin(line2, fin_start, fin)
-                ),
-            )
-            if resolved is not None:
-                return resolved
+        for window in windows:
+            normalized = normalize_fin_o0(window)
+            if is_valid_fin(normalized):
+                return normalized
         return None
 
     @staticmethod
@@ -596,14 +571,16 @@ class MRZExtractor:
                 optional_data.startswith(issuing_state)
                 and len(optional_data) >= len(issuing_state) + TD1_FIN.length
             ):
-                value = optional_data[
-                    len(issuing_state) : len(issuing_state) + TD1_FIN.length
-                ]
+                value = normalize_fin_o0(
+                    optional_data[
+                        len(issuing_state) : len(issuing_state) + TD1_FIN.length
+                    ]
+                )
                 if is_valid_fin(value):
                     score = 20 if offset == TD1_FIN.start else 14
                     candidates.append((score, value))
             # Direct FIN at the fixed optional-data start.
-            direct = optional_data[:TD1_FIN.length]
+            direct = normalize_fin_o0(optional_data[:TD1_FIN.length])
             if is_valid_fin(direct):
                 # Prefer when the window is exactly FIN (no AZE prefix noise).
                 exact = len(optional_data) == TD1_FIN.length
@@ -781,9 +758,9 @@ class MRZExtractor:
         fin_candidate = self._extract_td1_fin(line1, issuing_state)
         checksum_valid = self._td1_serial_checksum_valid(line1)
         line2_checksums_valid = self._td1_line2_checksums_valid(line2)
-        canonical_optional_data = line1[
-            TD1_FIN.start:TD1_OPTIONAL_END
-        ].rstrip("<")
+        canonical_optional_data = normalize_fin_o0(
+            line1[TD1_FIN.start:TD1_OPTIONAL_END].rstrip("<")
+        )
         canonical_values = {
             canonical_optional_data[:TD1_FIN.length],
         }
