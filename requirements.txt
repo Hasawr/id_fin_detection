@@ -7,3 +7,7 @@ numpy==1.26.4
 pillow==12.3.0
 streamlit==1.59.2
 setuptools
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic

@@ -4,6 +4,7 @@ import site
 import ctypes
 import logging
 from pathlib import Path
+import numpy as np
 
 # Pre-load NVIDIA CUDA/cuDNN libraries from virtualenv into global symbol table
 try:
@@ -48,17 +49,17 @@ class FINDetector:
         self.debug = debug
         self.use_gpu = use_gpu
 
-    def detect_from_viz(self, image_path: str | Path) -> FINDetectionOutput:
+    def detect_from_viz(self, image_input: str | Path | bytes | np.ndarray) -> FINDetectionOutput:
         """
         Run FIN detection on the VIZ (front) side of the ID card.
         """
-        image_path = Path(image_path)
-        logger.info(f"Processing VIZ side from: {image_path.name}")
+        img_name = Path(image_input).name if isinstance(image_input, (str, Path)) else "in_memory_image"
+        logger.info(f"Processing VIZ side from: {img_name}")
         notes = []
         
         try:
             # 1. Load image
-            img = self.preprocessor.load(image_path)
+            img = self.preprocessor.load(image_input)
             
             # 2. Deskew / Rectify card boundaries
             rectified = self.preprocessor.detect_card_roi(img)
@@ -76,8 +77,8 @@ class FINDetector:
             # 5. Debug output
             if self.debug and viz_result.fin:
                 annotated = draw_viz_debug(rectified, viz_result.bbox, viz_result.bbox, viz_result.fin)
-                save_debug_image(annotated, f"debug_viz_{image_path.name}")
-                notes.append(f"Saved debug image to debug_output/debug_viz_{image_path.name}")
+                save_debug_image(annotated, f"debug_viz_{img_name}")
+                notes.append(f"Saved debug image to debug_output/debug_viz_{img_name}")
                 
             return FINDetectionOutput(
                 viz_fin=viz_result.fin,
@@ -90,7 +91,7 @@ class FINDetector:
             )
             
         except Exception as e:
-            logger.error(f"Error processing VIZ image {image_path.name}: {e}", exc_info=True)
+            logger.error(f"Error processing VIZ image {img_name}: {e}", exc_info=True)
             return FINDetectionOutput(
                 viz_fin=None,
                 mrz_fin=None,
@@ -99,17 +100,17 @@ class FINDetector:
                 notes=[f"Failed to process VIZ image: {str(e)}"]
             )
 
-    def detect_from_mrz(self, image_path: str | Path) -> FINDetectionOutput:
+    def detect_from_mrz(self, image_input: str | Path | bytes | np.ndarray) -> FINDetectionOutput:
         """
         Run FIN detection on the MRZ (back) side of the ID card.
         """
-        image_path = Path(image_path)
-        logger.info(f"Processing MRZ side from: {image_path.name}")
+        img_name = Path(image_input).name if isinstance(image_input, (str, Path)) else "in_memory_image"
+        logger.info(f"Processing MRZ side from: {img_name}")
         notes = []
         
         try:
             # 1. Load image
-            img = self.preprocessor.load(image_path)
+            img = self.preprocessor.load(image_input)
             
             # 2. Deskew / Rectify card boundaries
             rectified = self.preprocessor.detect_card_roi(img)
@@ -150,8 +151,9 @@ class FINDetector:
                     id_number=mrz_result.id_number or "NOT_FOUND",
                     card_type=mrz_result.card_format
                 )
-                save_debug_image(annotated, f"debug_mrz_{image_path.name}")
-                notes.append(f"Saved debug image to debug_output/debug_mrz_{image_path.name}")
+                save_debug_image(annotated, f"debug_mrz_{img_name}")
+                notes.append(f"Saved debug image to debug_output/debug_mrz_{img_name}")
+
                 
             return FINDetectionOutput(
                 viz_fin=None,

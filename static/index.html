@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azerbaijani ID Card FIN & ID Parallel Detector</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #0F172A;
+            --bg-card: #1E293B;
+            --bg-input: #334155;
+            --text-main: #F8FAFC;
+            --text-muted: #94A3B8;
+            --accent-primary: #3B82F6;
+            --accent-hover: #2563EB;
+            --accent-gradient: linear-gradient(135deg, #2563EB 0%, #7C3AED 100%);
+            --success-color: #10B981;
+            --warning-color: #F59E0B;
+            --danger-color: #EF4444;
+            --border-color: #334155;
+            --card-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding-bottom: 3rem;
+            line-height: 1.5;
+        }
+
+        /* Top Header */
+        header {
+            background: rgba(30, 41, 59, 0.8);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--border-color);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo-area {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .logo-icon {
+            font-size: 1.8rem;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 800;
+        }
+
+        .logo-text {
+            font-size: 1.25rem;
+            font-weight: 800;
+            letter-spacing: -0.02em;
+            background: linear-gradient(90deg, #FFFFFF 0%, #CBD5E1 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .header-badges {
+            display: flex;
+            gap: 0.75rem;
+            align-items: center;
+        }
+
+        .badge {
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 0.35rem 0.75rem;
+            border-radius: 9999px;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            background-color: var(--bg-input);
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .badge-success {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34D399;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .badge-purple {
+            background: rgba(124, 58, 237, 0.15);
+            color: #C084FC;
+            border: 1px solid rgba(124, 58, 237, 0.3);
+        }
+
+        .badge-warning {
+            background: rgba(245, 158, 11, 0.15);
+            color: #FBBF24;
+            border: 1px solid rgba(245, 158, 11, 0.3);
+        }
+
+        .doc-link {
+            color: var(--accent-primary);
+            text-decoration: none;
+            font-size: 0.85rem;
+            font-weight: 600;
+            transition: color 0.2s;
+        }
+
+        .doc-link:hover {
+            color: #60A5FA;
+        }
+
+        /* Container */
+        .container {
+            max-width: 1280px;
+            margin: 2rem auto;
+            padding: 0 1.5rem;
+        }
+
+        /* Hero / Upload Card */
+        .upload-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 2rem;
+            box-shadow: var(--card-shadow);
+            margin-bottom: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #F1F5F9;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .section-subtitle {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            margin-bottom: 1.5rem;
+        }
+
+        /* Dropzone */
+        .dropzone {
+            border: 2px dashed var(--border-color);
+            border-radius: 0.75rem;
+            padding: 2.5rem 1.5rem;
+            text-align: center;
+            background: rgba(15, 23, 42, 0.4);
+            cursor: pointer;
+            transition: all 0.25s ease;
+            position: relative;
+        }
+
+        .dropzone:hover, .dropzone.drag-over {
+            border-color: var(--accent-primary);
+            background: rgba(59, 130, 246, 0.05);
+        }
+
+        .dropzone-icon {
+            font-size: 2.5rem;
+            margin-bottom: 0.75rem;
+            color: var(--accent-primary);
+        }
+
+        .dropzone-text {
+            font-weight: 600;
+            font-size: 1rem;
+            color: #E2E8F0;
+            margin-bottom: 0.25rem;
+        }
+
+        .dropzone-sub {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        /* Options & Controls */
+        .controls-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .mode-selector {
+            display: flex;
+            background: var(--bg-dark);
+            padding: 0.25rem;
+            border-radius: 0.5rem;
+            border: 1px solid var(--border-color);
+        }
+
+        .mode-btn {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .mode-btn.active {
+            background: var(--accent-primary);
+            color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .btn-primary {
+            background: var(--accent-gradient);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.75rem;
+            border-radius: 0.5rem;
+            font-weight: 700;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(37, 99, 235, 0.4);
+        }
+
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        /* Selected Files List */
+        .selected-files {
+            margin-top: 1rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+
+        .file-chip {
+            background: var(--bg-input);
+            padding: 0.3rem 0.6rem;
+            border-radius: 0.375rem;
+            font-size: 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            color: #CBD5E1;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        /* Analytics Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 0.75rem;
+            padding: 1.25rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+            background: var(--accent-gradient);
+        }
+
+        .stat-label {
+            font-size: 0.75rem;
+            font-weight: 700;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 0.35rem;
+        }
+
+        .stat-value {
+            font-size: 1.8rem;
+            font-weight: 800;
+            color: #F8FAFC;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        .stat-sub {
+            font-size: 0.75rem;
+            color: var(--success-color);
+            margin-top: 0.2rem;
+        }
+
+        /* Progress Bar */
+        .progress-wrapper {
+            margin-bottom: 1.5rem;
+            display: none;
+        }
+
+        .progress-bar-bg {
+            background: var(--bg-dark);
+            height: 8px;
+            border-radius: 9999px;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
+        }
+
+        .progress-bar-fill {
+            height: 100%;
+            width: 0%;
+            background: var(--accent-gradient);
+            transition: width 0.3s ease;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 0.8; }
+            50% { opacity: 1; }
+            100% { opacity: 0.8; }
+        }
+
+        /* Table Card */
+        .table-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            padding: 1.5rem;
+            box-shadow: var(--card-shadow);
+        }
+
+        .table-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        .search-box {
+            background: var(--bg-dark);
+            border: 1px solid var(--border-color);
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            color: var(--text-main);
+            font-size: 0.85rem;
+            width: 260px;
+            outline: none;
+        }
+
+        .search-box:focus {
+            border-color: var(--accent-primary);
+        }
+
+        .export-btns {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: #E2E8F0;
+            border: 1px solid var(--border-color);
+            padding: 0.4rem 0.85rem;
+            border-radius: 0.375rem;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-secondary:hover {
+            background: #475569;
+        }
+
+        /* Table */
+        .table-responsive {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            font-size: 0.875rem;
+        }
+
+        th {
+            background: rgba(15, 23, 42, 0.6);
+            color: var(--text-muted);
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.7rem;
+            letter-spacing: 0.06em;
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        td {
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid rgba(51, 65, 85, 0.5);
+            vertical-align: middle;
+        }
+
+        tr:hover td {
+            background: rgba(51, 65, 85, 0.2);
+        }
+
+        .fin-tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            font-size: 1.05rem;
+            color: #F8FAFC;
+            letter-spacing: 0.05em;
+        }
+
+        .id-tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            color: #93C5FD;
+        }
+
+        /* Modal Drawer */
+        .modal-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(8px);
+            z-index: 200;
+            display: none;
+            justify-content: center;
+            align-items: center;
+            padding: 1.5rem;
+        }
+
+        .modal-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 1rem;
+            max-width: 900px;
+            width: 100%;
+            max-height: 90vh;
+            overflow-y: auto;
+            padding: 1.5rem;
+            box-shadow: var(--card-shadow);
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 0.75rem;
+            margin-bottom: 1rem;
+        }
+
+        .modal-close {
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+        .modal-img {
+            width: 100%;
+            border-radius: 0.5rem;
+            border: 1px solid var(--border-color);
+            margin-top: 1rem;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-muted);
+        }
+
+        .empty-icon {
+            font-size: 3rem;
+            margin-bottom: 0.5rem;
+            opacity: 0.5;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Top Header Navigation -->
+    <header>
+        <div class="logo-area">
+            <span class="logo-icon">🆔</span>
+            <span class="logo-text">AZERBAIJAN ID FIN DETECTOR</span>
+        </div>
+        <div class="header-badges">
+            <span class="badge badge-success" id="gpu-badge">⚡ GPU Accelerated</span>
+            <span class="badge badge-purple" id="workers-badge">⚙️ 4 Workers Pool</span>
+            <a href="/docs" target="_blank" class="doc-link">API Docs ↗</a>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Upload Card Section -->
+        <div class="upload-card">
+            <div class="section-title">
+                <span>📁</span> Mass Parallel Batch Processing
+            </div>
+            <div class="section-subtitle">
+                Select or drop up to 100 ID card images (MRZ back side or VIZ front side). Processed concurrently across GPU process pool.
+            </div>
+
+            <div class="dropzone" id="dropzone">
+                <div class="dropzone-icon">📤</div>
+                <div class="dropzone-text">Drag & drop ID card images here, or click to select</div>
+                <div class="dropzone-sub">Supports PNG, JPG, JPEG, WEBP (Batch limit: 100 images)</div>
+                <input type="file" id="file-input" class="file-input" multiple accept="image/*">
+            </div>
+
+            <div class="selected-files" id="selected-files-list"></div>
+
+            <div class="controls-row">
+                <div class="mode-selector">
+                    <button class="mode-btn active" data-mode="mrz">MRZ Side (Back)</button>
+                    <button class="mode-btn" data-mode="viz">VIZ Side (Front)</button>
+                </div>
+                <button class="btn-primary" id="btn-process" disabled>
+                    <span>⚡ Process Batch Now</span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Progress Indicator -->
+        <div class="progress-wrapper" id="progress-wrapper">
+            <div style="display: flex; justify-content: space-between; margin-bottom: 0.4rem; font-size: 0.85rem; font-weight: 600;">
+                <span id="progress-text">Processing batch across worker pool...</span>
+                <span id="progress-percentage">Executing...</span>
+            </div>
+            <div class="progress-bar-bg">
+                <div class="progress-bar-fill" id="progress-fill"></div>
+            </div>
+        </div>
+
+        <!-- Analytics Stats Cards -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">Total Processed</div>
+                <div class="stat-value" id="stat-total">0</div>
+                <div class="stat-sub" id="stat-success-rate">Ready</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Execution Time</div>
+                <div class="stat-value" id="stat-time">0.00s</div>
+                <div class="stat-sub">Batch total latency</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Throughput</div>
+                <div class="stat-value" id="stat-fps">0.0</div>
+                <div class="stat-sub">Images / second</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Avg Latency</div>
+                <div class="stat-value" id="stat-avg">0ms</div>
+                <div class="stat-sub">Per document</div>
+            </div>
+        </div>
+
+        <!-- Results Table Card -->
+        <div class="table-card">
+            <div class="table-header">
+                <div class="section-title" style="margin-bottom: 0;">
+                    <span>📊</span> Batch Extraction Results
+                </div>
+                <div style="display: flex; gap: 0.75rem; align-items: center;">
+                    <input type="text" class="search-box" id="search-input" placeholder="🔍 Search by FIN or ID...">
+                    <div class="export-btns">
+                        <button class="btn-secondary" id="btn-export-json">JSON</button>
+                        <button class="btn-secondary" id="btn-export-csv">CSV</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Filename</th>
+                            <th>FIN Code</th>
+                            <th>ID Number</th>
+                            <th>Card Format</th>
+                            <th>Checksum</th>
+                            <th>Confidence</th>
+                            <th>Latency</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-tbody">
+                        <tr>
+                            <td colspan="9">
+                                <div class="empty-state">
+                                    <div class="empty-icon">📂</div>
+                                    <p>No batch processed yet. Upload images above to view extraction results.</p>
+                                </div>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal Drawer for Visual Debug Overlay -->
+    <div class="modal-overlay" id="modal-overlay">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3 id="modal-title" style="font-weight: 700;">Visual Debug Inspection</h3>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            <div id="modal-content">
+                <p id="modal-details" style="color: var(--text-muted); font-size: 0.9rem;"></p>
+                <img src="" alt="Visual Debug Overlay" class="modal-img" id="modal-img">
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Global App State
+        let selectedFiles = [];
+        let activeMode = 'mrz';
+        let currentResultsData = null;
+
+        // Elements
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('file-input');
+        const selectedFilesList = document.getElementById('selected-files-list');
+        const btnProcess = document.getElementById('btn-process');
+        const modeBtns = document.querySelectorAll('.mode-btn');
+        const progressWrapper = document.getElementById('progress-wrapper');
+        const progressFill = document.getElementById('progress-fill');
+        const resultsTbody = document.getElementById('results-tbody');
+        const searchInput = document.getElementById('search-input');
+
+        // Initial System Health Fetch
+        async function fetchSystemHealth() {
+            try {
+                const res = await fetch('/health');
+                const data = await res.json();
+                document.getElementById('gpu-badge').textContent = data.gpu_enabled ? '⚡ GPU Accelerated (CUDA 12)' : '💻 CPU Mode';
+            } catch (e) {
+                console.error(e);
+            }
+        }
+        fetchSystemHealth();
+
+        // Mode Switcher
+        modeBtns.forEach(btn => {
+            btn.addEventListener('click', () => {
+                modeBtns.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                activeMode = btn.dataset.mode;
+            });
+        });
+
+        // Dropzone Click & Drag events
+        dropzone.addEventListener('click', () => fileInput.click());
+
+        dropzone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropzone.classList.add('drag-over');
+        });
+
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
+
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('drag-over');
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                handleFiles(Array.from(e.dataTransfer.files));
+            }
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files && e.target.files.length > 0) {
+                handleFiles(Array.from(e.target.files));
+            }
+        });
+
+        function handleFiles(files) {
+            const validImages = files.filter(f => f.type.startsWith('image/'));
+            selectedFiles = validImages.slice(0, 150); // Cap at 150 max
+
+            selectedFilesList.innerHTML = selectedFiles.map(f => `
+                <div class="file-chip">
+                    📄 ${f.name} (${(f.size / 1024).toFixed(1)} KB)
+                </div>
+            `).join('');
+
+            btnProcess.disabled = selectedFiles.length === 0;
+            btnProcess.innerHTML = `<span>⚡ Process ${selectedFiles.length} Image${selectedFiles.length > 1 ? 's' : ''}</span>`;
+        }
+
+        // Process Batch Handler
+        btnProcess.addEventListener('click', async () => {
+            if (selectedFiles.length === 0) return;
+
+            btnProcess.disabled = true;
+            progressWrapper.style.display = 'block';
+            progressFill.style.width = '30%';
+
+            const formData = new FormData();
+            selectedFiles.forEach(file => formData.append('files', file));
+            formData.append('mode', activeMode);
+
+            try {
+                progressFill.style.width = '70%';
+                const response = await fetch('/api/v1/detect_batch', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+                progressFill.style.width = '100%';
+                
+                setTimeout(() => {
+                    progressWrapper.style.display = 'none';
+                    progressFill.style.width = '0%';
+                }, 400);
+
+                currentResultsData = data;
+                renderAnalytics(data);
+                renderTable(data.results);
+            } catch (err) {
+                alert('Error processing batch: ' + err.message);
+                progressWrapper.style.display = 'none';
+            } finally {
+                btnProcess.disabled = false;
+            }
+        });
+
+        // Analytics Renderer
+        function renderAnalytics(data) {
+            document.getElementById('stat-total').textContent = data.total_images || 0;
+            document.getElementById('stat-success-rate').textContent = `${data.successful || 0} Successful (${data.failed || 0} Failed)`;
+            document.getElementById('stat-time').textContent = `${(data.elapsed_seconds || 0).toFixed(2)}s`;
+            document.getElementById('stat-fps').textContent = `${(data.throughput_img_per_sec || 0).toFixed(1)} FPS`;
+            document.getElementById('stat-avg').textContent = `${(data.avg_latency_ms || 0).toFixed(0)}ms`;
+        }
+
+        // Table Renderer
+        function renderTable(results) {
+            if (!results || results.length === 0) {
+                resultsTbody.innerHTML = `<tr><td colspan="9" class="empty-state">No results returned.</td></tr>`;
+                return;
+            }
+
+            resultsTbody.innerHTML = results.map((item, idx) => {
+                const finStr = item.fin || 'NOT FOUND';
+                const isSuccess = item.status === 'success' && item.fin;
+                const finClass = isSuccess ? 'fin-tag' : 'fin-tag danger-text';
+                
+                const cardBadge = item.is_old_card 
+                    ? `<span class="badge badge-warning">🟡 Old ID (TD2)</span>` 
+                    : `<span class="badge badge-success">🟢 Biometric (TD1)</span>`;
+
+                const checksumBadge = item.checksum_valid
+                    ? `<span class="badge badge-success">VALID</span>`
+                    : `<span class="badge badge-warning">UNVERIFIED</span>`;
+
+                const debugImgPath = `/debug_output/debug_mrz_${item.id}`;
+
+                return `
+                    <tr>
+                        <td style="color: var(--text-muted); font-size: 0.75rem;">${idx + 1}</td>
+                        <td style="font-weight: 600; font-size: 0.85rem;">${item.id}</td>
+                        <td><span class="${finClass}">${finStr}</span></td>
+                        <td><span class="id-tag">${item.id_number || 'N/A'}</span></td>
+                        <td>${cardBadge}</td>
+                        <td>${checksumBadge}</td>
+                        <td style="font-weight: 600;">${item.confidence ? (item.confidence * 100).toFixed(1) + '%' : '0%'}</td>
+                        <td style="font-family: 'JetBrains Mono'; font-size: 0.8rem; color: var(--text-muted);">${item.elapsed_ms || 0}ms</td>
+                        <td>
+                            <button class="btn-secondary" onclick="openModal('${item.id}', '${finStr}', '${item.id_number || 'N/A'}', '${debugImgPath}')">View Overlay</button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // Live Search Filter
+        searchInput.addEventListener('input', (e) => {
+            if (!currentResultsData || !currentResultsData.results) return;
+            const query = e.target.value.toLowerCase();
+            const filtered = currentResultsData.results.filter(r => 
+                (r.id && r.id.toLowerCase().includes(query)) ||
+                (r.fin && r.fin.toLowerCase().includes(query)) ||
+                (r.id_number && r.id_number.toLowerCase().includes(query))
+            );
+            renderTable(filtered);
+        });
+
+        // Modal Handler
+        const modalOverlay = document.getElementById('modal-overlay');
+        const modalTitle = document.getElementById('modal-title');
+        const modalDetails = document.getElementById('modal-details');
+        const modalImg = document.getElementById('modal-img');
+        const modalClose = document.getElementById('modal-close');
+
+        function openModal(id, fin, idNum, imgPath) {
+            modalTitle.textContent = `Visual Debug Overlay: ${id}`;
+            modalDetails.textContent = `Extracted FIN: ${fin} | ID Number: ${idNum}`;
+            modalImg.src = imgPath;
+            modalOverlay.style.display = 'flex';
+        }
+
+        modalClose.addEventListener('click', () => modalOverlay.style.display = 'none');
+        modalOverlay.addEventListener('click', (e) => {
+            if (e.target === modalOverlay) modalOverlay.style.display = 'none';
+        });
+
+        // Export Options
+        document.getElementById('btn-export-json').addEventListener('click', () => {
+            if (!currentResultsData) return alert('No results to export.');
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentResultsData, null, 2));
+            const downloadAnchor = document.createElement('a');
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", "fin_batch_results.json");
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
+        });
+
+        document.getElementById('btn-export-csv').addEventListener('click', () => {
+            if (!currentResultsData || !currentResultsData.results) return alert('No results to export.');
+            let csv = "Filename,Status,FIN,ID_Number,Card_Format,Checksum_Valid,Confidence,Latency_ms\n";
+            currentResultsData.results.forEach(r => {
+                csv += `"${r.id}","${r.status}","${r.fin || ''}","${r.id_number || ''}","${r.card_format || ''}",${r.checksum_valid || false},${r.confidence || 0},${r.elapsed_ms || 0}\n`;
+            });
+            const dataStr = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
+            const downloadAnchor = document.createElement('a');
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", "fin_batch_results.csv");
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
+        });
+    </script>
+</body>
+</html>

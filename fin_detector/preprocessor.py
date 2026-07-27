@@ -6,9 +6,17 @@ class ImagePreprocessor:
     """Class to load, deskew, enhance, and detect ROI from ID card images."""
 
     @staticmethod
-    def load(image_path: str | Path) -> np.ndarray:
-        """Load image via OpenCV supporting various formats."""
-        path_str = str(image_path)
+    def load(image_input: str | Path | bytes | np.ndarray) -> np.ndarray:
+        """Load image via OpenCV supporting file paths, raw bytes, or existing numpy arrays."""
+        if isinstance(image_input, np.ndarray):
+            return image_input
+        if isinstance(image_input, bytes):
+            nparr = np.frombuffer(image_input, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError("Could not decode image from raw bytes.")
+            return img
+        path_str = str(image_input)
         img = cv2.imread(path_str)
         if img is None:
             raise FileNotFoundError(f"Could not load image at path: {path_str}")
