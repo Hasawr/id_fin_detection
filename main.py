@@ -44,6 +44,7 @@ def output_as_json(result: FINDetectionOutput):
     data = {
         "viz_fin": result.viz_fin,
         "mrz_fin": result.mrz_fin,
+        "mrz_id_number": result.mrz_id_number,
         "viz_confidence": float(round(result.viz_confidence, 4)),
         "mrz_confidence": float(round(result.mrz_confidence, 4)),
         "viz_details": {
@@ -52,6 +53,8 @@ def output_as_json(result: FINDetectionOutput):
         } if result.viz_result else None,
         "mrz_details": {
             "method": result.mrz_result.method,
+            "id_number": result.mrz_result.id_number,
+            "card_format": result.mrz_result.card_format,
             "line1": result.mrz_result.line1,
             "line2": result.mrz_result.line2,
             "line3": result.mrz_result.line3,
@@ -74,10 +77,14 @@ def output_as_text(result: FINDetectionOutput):
     mrz_fin_str = result.mrz_fin if result.mrz_fin else "Not Found / Not Scanned"
     mrz_conf_str = f"({result.mrz_confidence:.2f})" if result.mrz_fin else ""
     print(f" MRZ Side (Back) FIN:   {mrz_fin_str:<25} {mrz_conf_str}")
+
+    mrz_id_str = result.mrz_id_number if result.mrz_id_number else "Not Found / Not Scanned"
+    print(f" MRZ Side ID Number:    {mrz_id_str:<25}")
     
     if result.mrz_result and result.mrz_result.line1:
         print("-" * 60)
         print(" MRZ Line Details:")
+        print(f"   Card Format: {result.mrz_result.card_format}")
         print(f"   Line 1: {result.mrz_result.line1}")
         print(f"   Line 2: {result.mrz_result.line2}")
         print(f"   Line 3: {result.mrz_result.line3}")

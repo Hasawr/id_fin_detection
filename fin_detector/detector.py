@@ -1,6 +1,26 @@
+import os
+import glob
+import site
+import ctypes
 import logging
 from pathlib import Path
-from paddleocr import PaddleOCR
+
+# Pre-load NVIDIA CUDA/cuDNN libraries from virtualenv into global symbol table
+try:
+    site_pkg = site.getsitepackages()[0]
+    nvidia_dirs = glob.glob(os.path.join(site_pkg, 'nvidia', '*', 'lib'))
+    if nvidia_dirs:
+        os.environ['LD_LIBRARY_PATH'] = ':'.join(nvidia_dirs) + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+        for d in nvidia_dirs:
+            for so_file in glob.glob(os.path.join(d, '*.so*')):
+                try:
+                    ctypes.CDLL(so_file, mode=ctypes.RTLD_GLOBAL)
+                except Exception:
+                    pass
+except Exception:
+    pass
+
+from .ocr_engine import OCREngineAdapter
 
 from .preprocessor import ImagePreprocessor
 from .viz_extractor import VIZExtractor
@@ -13,19 +33,20 @@ logger = logging.getLogger(__name__)
 class FINDetector:
     """Orchestrator class to run FIN code detection on VIZ and/or MRZ sides of ID cards."""
 
-    def __init__(self, use_gpu: bool = False, debug: bool = False):
+    def __init__(self, use_gpu: bool = True, debug: bool = False):
         """
-        Initialize PaddleOCR engine and extractor components.
+        Initialize OCR engine and extractor components on GPU/CPU.
         """
         logger.info(f"Initializing FINDetector (use_gpu={use_gpu}, debug={debug})...")
         
-        # Initialize the shared PaddleOCR instance once
-        self.ocr_engine = PaddleOCR(use_angle_cls=False, lang='en', show_log=False, use_gpu=use_gpu)
+        # Initialize OCR engine strictly on requested device
+        self.ocr_engine = OCREngineAdapter(use_gpu=use_gpu)
         
         self.preprocessor = ImagePreprocessor()
         self.viz_extractor = VIZExtractor(self.ocr_engine)
         self.mrz_extractor = MRZExtractor(self.ocr_engine)
         self.debug = debug
+        self.use_gpu = use_gpu
 
     def detect_from_viz(self, image_path: str | Path) -> FINDetectionOutput:
         """
@@ -101,13 +122,22 @@ class FINDetector:
             enhanced_mrz = self.preprocessor.enhance_for_mrz(rectified)
             mrz_result = self.mrz_extractor.extract(enhanced_mrz, is_cropped=True)
             
-            # 4. Fallback to full rectified image if cropped failed to find a valid 7-character FIN
+            # 4. Fallback sequence if cropped 25% failed to extract valid FIN
             if not mrz_result.fin or len(mrz_result.fin) != 7:
-                logger.info("FIN not found or not 7 chars in cropped MRZ band; trying fallback on full rectified image")
+                logger.info("FIN not found in 25% MRZ crop; trying wider bottom 45% crop...")
+                enhanced_wide = self.preprocessor.enhance_for_mrz_wide(rectified)
+                mrz_result = self.mrz_extractor.extract(enhanced_wide, is_cropped=True)
+                notes.append("Tried wider 45% MRZ crop fallback.")
+
+            if not mrz_result.fin or len(mrz_result.fin) != 7:
+                logger.info("FIN not found in cropped MRZ bands; trying fallback on full rectified image")
                 mrz_result = self.mrz_extractor.extract(rectified, is_cropped=False)
                 notes.append("FIN extraction fell back to full image scan.")
             else:
                 notes.append("FIN successfully extracted from cropped MRZ band.")
+                
+            if mrz_result.is_old_card:
+                notes.append(f"Card format: {mrz_result.card_format}")
                 
             # 5. Debug output
             if self.debug:
@@ -116,7 +146,9 @@ class FINDetector:
                     mrz_result.line1, 
                     mrz_result.line2, 
                     mrz_result.line3, 
-                    mrz_result.fin or "NOT_FOUND"
+                    mrz_result.fin or "NOT_FOUND",
+                    id_number=mrz_result.id_number or "NOT_FOUND",
+                    card_type=mrz_result.card_format
                 )
                 save_debug_image(annotated, f"debug_mrz_{image_path.name}")
                 notes.append(f"Saved debug image to debug_output/debug_mrz_{image_path.name}")
@@ -126,6 +158,7 @@ class FINDetector:
                 mrz_fin=mrz_result.fin,
                 viz_confidence=0.0,
                 mrz_confidence=mrz_result.confidence,
+                mrz_id_number=mrz_result.id_number,
                 viz_result=None,
                 mrz_result=mrz_result,
                 notes=notes
@@ -138,6 +171,7 @@ class FINDetector:
                 mrz_fin=None,
                 viz_confidence=0.0,
                 mrz_confidence=0.0,
+                mrz_id_number=None,
                 notes=[f"Failed to process MRZ image: {str(e)}"]
             )
 
@@ -157,6 +191,7 @@ class FINDetector:
             mrz_fin=mrz_out.mrz_fin,
             viz_confidence=viz_out.viz_confidence,
             mrz_confidence=mrz_out.mrz_confidence,
+            mrz_id_number=mrz_out.mrz_id_number,
             viz_result=viz_out.viz_result,
             mrz_result=mrz_out.mrz_result,
             notes=combined_notes

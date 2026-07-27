@@ -1,12 +1,20 @@
 import re
 
 FIN_PATTERN = re.compile(r'^[A-Z0-9]{7}$')
+ID_NUMBER_OLD = re.compile(r'^[A-Z]{3}\d{7,9}$')   # e.g., AZE14431397
+ID_NUMBER_NEW = re.compile(r'^[A-Z]{2}\d{7}$')      # e.g., AA3778866
 
 def is_valid_fin(fin: str) -> bool:
     """Returns True if fin matches the 7-char alphanumeric pattern."""
     if not fin:
         return False
     return bool(FIN_PATTERN.match(fin))
+
+def is_valid_id_number(id_num: str) -> bool:
+    """Returns True if id_num matches standard Azerbaijani ID number patterns."""
+    if not id_num:
+        return False
+    return bool(ID_NUMBER_OLD.match(id_num) or ID_NUMBER_NEW.match(id_num))
 
 def clean_ocr_text(text: str) -> str:
     """Strip whitespace and convert to uppercase."""

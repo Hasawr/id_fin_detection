@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import tempfile
 import time
@@ -8,24 +9,23 @@ import cv2
 import numpy as np
 
 # Ensure project root is in sys.path
-import sys
 sys.path.append(str(Path(__file__).parent))
 
 from fin_detector.detector import FINDetector
 
 # Setup page config
 st.set_page_config(
-    page_title="Azerbaijani ID FIN Detector",
+    page_title="Azerbaijani ID Card FIN & ID Detector",
     page_icon="🆔",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for polished, premium styling
+# Custom CSS for modern styling
 st.markdown("""
     <style>
     .main-title {
-        font-size: 2.6rem;
+        font-size: 2.4rem;
         font-weight: 800;
         background: linear-gradient(135deg, #1E3A8A 0%, #3B82F6 100%);
         -webkit-background-clip: text;
@@ -33,9 +33,9 @@ st.markdown("""
         margin-bottom: 0.1rem;
     }
     .sub-title {
-        font-size: 1.1rem;
+        font-size: 1.05rem;
         color: #4B5563;
-        margin-bottom: 2rem;
+        margin-bottom: 1.5rem;
     }
     .card {
         background-color: #F8FAFC;
@@ -56,11 +56,11 @@ st.markdown("""
         padding-bottom: 0.5rem;
     }
     .fin-box {
-        font-size: 2rem;
+        font-size: 1.8rem;
         font-weight: 800;
         color: #0F172A;
-        letter-spacing: 0.1em;
-        margin: 0.5rem 0;
+        letter-spacing: 0.08em;
+        margin: 0.4rem 0;
     }
     .conf-box {
         font-size: 0.9rem;
@@ -78,181 +78,119 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">Azerbaijani ID Card FIN Detector</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Extract and verify FIN codes from Visual Zone (front) and Machine Readable Zone (back) images</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">Azerbaijani ID Card FIN & ID Detector</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Extract and verify FIN codes & ID Numbers from Machine Readable Zone (MRZ)</div>', unsafe_allow_html=True)
 
 # Ensure the local documents folder exists in the project root
 DOCS_DIR = Path(__file__).parent / "documents"
 DOCS_DIR.mkdir(exist_ok=True)
 
-# Initialize FINDetector once in session state
-if "detector" not in st.session_state:
-    with st.spinner("Initializing PaddleOCR Engine..."):
-        # We default to cpu for simple user setup, let user pick gpu in sidebar
-        st.session_state["detector"] = FINDetector(use_gpu=False, debug=True)
-
-# Sidebar options
+# Initialize FINDetector in session state with automatic update on GPU toggle
 with st.sidebar:
-    st.header("Settings")
-    use_gpu = st.checkbox("Use GPU (requires CUDA)", value=False)
+    st.header("Engine Settings")
+    use_gpu = st.checkbox("Use GPU (CUDA Enabled)", value=True)
+    
+    if "detector" not in st.session_state or st.session_state.get("active_gpu_setting") != use_gpu:
+        with st.spinner(f"Initializing PaddleOCR Engine (use_gpu={use_gpu})..."):
+            st.session_state["detector"] = FINDetector(use_gpu=use_gpu, debug=True)
+            st.session_state["active_gpu_setting"] = use_gpu
+        st.toast(f"Engine active: GPU={use_gpu}", icon="⚡")
+        
     if st.button("Re-initialize Engine"):
         with st.spinner("Re-initializing..."):
             st.session_state["detector"] = FINDetector(use_gpu=use_gpu, debug=True)
+            st.session_state["active_gpu_setting"] = use_gpu
         st.success("Re-initialized!")
         
     st.markdown("---")
     st.markdown("""
     ### App Information
-    This UI runs the Azerbaijani national ID card OCR pipeline to extract the 7-character FIN code.
+    Supports both Azerbaijani card formats:
+    - **Old ID Cards (TD2, 2-Line MRZ)**: ID Number format `AZE12345678`, FIN code `7-char`
+    - **New Biometric Cards (TD1, 3-Line MRZ)**: ID Number format `AA1234567`, FIN code `7-char`
     
-    Processed debug images highlighting the extracted areas are copied directly to the `documents/` folder.
+    Processed debug images are saved directly to `documents/`.
     """)
 
-# Layout: two columns for uploaders
-col_upload_viz, col_upload_mrz = st.columns(2)
+# Layout: Left column for Upload, Right column for Results
+col_left, col_right = st.columns([1, 1], gap="medium")
 
-with col_upload_viz:
-    st.subheader("Front Side (VIZ Zone)")
-    viz_file = st.file_uploader(
-        "Upload VIZ front image",
-        type=["png", "jpg", "jpeg", "webp", "bmp"],
-        key="viz_uploader"
-    )
-    if viz_file:
-        st.image(viz_file, caption="Uploaded Front Side Image", use_container_width=True)
-
-with col_upload_mrz:
-    st.subheader("Back Side (MRZ Zone)")
+with col_left:
+    st.subheader("1. Upload MRZ Image (Back Side)")
     mrz_file = st.file_uploader(
-        "Upload MRZ back image",
+        "Drag and drop or select MRZ back image",
         type=["png", "jpg", "jpeg", "webp", "bmp"],
         key="mrz_uploader"
     )
-    if mrz_file:
-        st.image(mrz_file, caption="Uploaded Back Side Image", use_container_width=True)
-
-# Run button
-st.markdown("<br>", unsafe_allow_html=True)
-run_pipeline = st.button("Process ID Card", type="primary", disabled=not (viz_file or mrz_file))
-
-if run_pipeline:
-    detector = st.session_state["detector"]
     
-    # Create a temporary directory to save files for processing
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
+    if mrz_file:
+        st.image(mrz_file, caption="Uploaded MRZ Image", use_container_width=True)
+
+with col_right:
+    st.subheader("2. Extraction Result")
+    
+    if mrz_file:
+        detector = st.session_state["detector"]
         
-        viz_path = None
-        mrz_path = None
-        
-        if viz_file:
-            viz_path = tmp_path / viz_file.name
-            viz_path.write_bytes(viz_file.getvalue())
-            
-        if mrz_file:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
             mrz_path = tmp_path / mrz_file.name
             mrz_path.write_bytes(mrz_file.getvalue())
             
-        # Run processing
-        with st.spinner("Extracting text and locating FIN..."):
-            start_time = time.time()
-            if viz_path and mrz_path:
-                result = detector.detect_from_both(viz_path, mrz_path)
-            elif viz_path:
-                result = detector.detect_from_viz(viz_path)
-            else:
+            with st.spinner("Processing MRZ image..."):
+                start_time = time.time()
                 result = detector.detect_from_mrz(mrz_path)
-            elapsed_time = time.time() - start_time
+                elapsed_time = time.time() - start_time
+                
+            st.caption(f"⚡ Processed in {elapsed_time:.2f} seconds")
             
-        st.success(f"Processing completed in {elapsed_time:.2f} seconds.")
-        st.divider()
-        
-        # Display Structured Outputs
-        st.header("Structured Extraction Results")
-        
-        # Create columns for front and back results
-        col_res_viz, col_res_mrz = st.columns(2)
-        
-        with col_res_viz:
             st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="card-header">Front Side (VIZ) Extraction</div>', unsafe_allow_html=True)
-            if viz_file:
-                if result.viz_fin:
-                    st.markdown(f'<div class="fin-box">{result.viz_fin}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="conf-box success-text">Confidence: {result.viz_confidence:.4f}</div>', unsafe_allow_html=True)
-                    st.caption(f"Method used: {result.viz_result.method}")
-                else:
-                    st.markdown('<div class="fin-box danger-text">NOT FOUND</div>', unsafe_allow_html=True)
-                    st.markdown('<div class="conf-box danger-text">Confidence: 0.0000</div>', unsafe_allow_html=True)
-            else:
-                st.info("Front image not uploaded.")
-            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('<div class="card-header">MRZ Extraction Output</div>', unsafe_allow_html=True)
             
-        with col_res_mrz:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<div class="card-header">Back Side (MRZ) Extraction</div>', unsafe_allow_html=True)
-            if mrz_file:
+            if result.mrz_fin or result.mrz_id_number:
                 if result.mrz_fin:
-                    st.markdown(f'<div class="fin-box">{result.mrz_fin}</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="conf-box success-text">Confidence: {result.mrz_confidence:.4f}</div>', unsafe_allow_html=True)
-                    st.caption(f"Method used: {result.mrz_result.method}")
+                    st.markdown(f'<div class="fin-box">FIN: {result.mrz_fin}</div>', unsafe_allow_html=True)
+                if result.mrz_id_number:
+                    st.markdown(f'### ID Number: `{result.mrz_id_number}`')
+                    
+                st.markdown(f'<div class="conf-box success-text">Confidence: {result.mrz_confidence:.4f}</div>', unsafe_allow_html=True)
+                st.caption(f"Method used: {result.mrz_result.method if result.mrz_result else 'N/A'}")
+                st.markdown("---")
+                
+                if result.mrz_result:
+                    if result.mrz_result.is_old_card:
+                        st.markdown("**Card Type**: 🟡 **Old ID Card (TD2, 2-Line MRZ)**")
+                    else:
+                        st.markdown("**Card Type**: 🟢 **New Biometric ID Card (TD1, 3-Line MRZ)**")
+                        
                     st.markdown(f"**Line 1**: `{result.mrz_result.line1}`")
                     st.markdown(f"**Line 2**: `{result.mrz_result.line2}`")
-                    st.markdown(f"**Line 3**: `{result.mrz_result.line3}`")
+                    if result.mrz_result.line3:
+                        st.markdown(f"**Line 3**: `{result.mrz_result.line3}`")
+                        
                     checksum_class = "success-text" if result.mrz_result.checksum_valid else "warning-text"
                     checksum_status = "VALID" if result.mrz_result.checksum_valid else "INVALID / UNKNOWN"
                     st.markdown(f"**Document Checksum**: <span class='{checksum_class}'>**{checksum_status}**</span>", unsafe_allow_html=True)
-                else:
-                    st.markdown('<div class="fin-box danger-text">NOT FOUND</div>', unsafe_allow_html=True)
-                    st.markdown('<div class="conf-box danger-text">Confidence: 0.0000</div>', unsafe_allow_html=True)
             else:
-                st.info("Back image not uploaded.")
+                st.markdown('<div class="fin-box danger-text">NOT FOUND</div>', unsafe_allow_html=True)
+                st.markdown('<div class="conf-box danger-text">Confidence: 0.0000</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
             
-        # Display debug images and copy them to documents folder
-        st.header("Visual Debug & Bounding Boxes")
-        st.info("Highlights show the detected labels and extraction regions. Images are saved to the local `documents/` folder.")
-        
-        col_img_viz, col_img_mrz = st.columns(2)
-        
-        # We need to find the files in ./debug_output/ and display them
-        debug_output_dir = Path("debug_output")
-        
-        with col_img_viz:
-            if viz_file and result.viz_fin:
-                debug_viz_name = f"debug_viz_{viz_file.name}"
-                debug_viz_path = debug_output_dir / debug_viz_name
-                if debug_viz_path.exists():
-                    st.image(str(debug_viz_path), caption="VIZ Bounding Box Highlight", use_container_width=True)
-                    
-                    # Copy to documents folder
-                    dest_path = DOCS_DIR / debug_viz_name
-                    shutil.copy(str(debug_viz_path), str(dest_path))
-                    st.success(f"Uploaded and saved front image to: [documents/{debug_viz_name}](file:///{dest_path.as_posix()})")
-                else:
-                    st.warning("Debug VIZ image file not found.")
-            elif viz_file:
-                st.warning("No VIZ FIN detected, debug image not created.")
+            # Display debug image overlay
+            debug_output_dir = Path("debug_output")
+            debug_mrz_name = f"debug_mrz_{mrz_file.name}"
+            debug_mrz_path = debug_output_dir / debug_mrz_name
+            if debug_mrz_path.exists():
+                st.subheader("Visual Debug Overlay")
+                st.image(str(debug_mrz_path), caption="Annotated MRZ Bounding Boxes & Text", use_container_width=True)
                 
-        with col_img_mrz:
-            if mrz_file:
-                debug_mrz_name = f"debug_mrz_{mrz_file.name}"
-                debug_mrz_path = debug_output_dir / debug_mrz_name
-                if debug_mrz_path.exists():
-                    st.image(str(debug_mrz_path), caption="MRZ Text Overlay Highlight", use_container_width=True)
-                    
-                    # Copy to documents folder
-                    dest_path = DOCS_DIR / debug_mrz_name
-                    shutil.copy(str(debug_mrz_path), str(dest_path))
-                    st.success(f"Uploaded and saved back image to: [documents/{debug_mrz_name}](file:///{dest_path.as_posix()})")
-                else:
-                    st.warning("Debug MRZ image file not found.")
-            elif mrz_file:
-                st.warning("No MRZ detected, debug image not created.")
+                dest_path = DOCS_DIR / debug_mrz_name
+                shutil.copy(str(debug_mrz_path), str(dest_path))
+                st.success(f"Saved debug artifact to: [documents/{debug_mrz_name}](file:///{dest_path.as_posix()})")
                 
-        # Notes
-        if result.notes:
-            st.divider()
-            with st.expander("Show System Processing Notes", expanded=False):
-                for note in result.notes:
-                    st.write(f"- {note}")
+            if result.notes:
+                with st.expander("System Processing Notes", expanded=False):
+                    for note in result.notes:
+                        st.write(f"- {note}")
+    else:
+        st.info("👈 Please drag and drop or upload an MRZ image on the left panel to extract details.")

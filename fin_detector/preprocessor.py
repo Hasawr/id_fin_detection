@@ -74,6 +74,19 @@ class ImagePreprocessor:
         return cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
 
     @staticmethod
+    def enhance_for_mrz_wide(img: np.ndarray) -> np.ndarray:
+        """Crop and enhance the bottom 45% MRZ area for old card (TD2) detection."""
+        h, w = img.shape[:2]
+        mrz_y = int(h * 0.55)
+        mrz_crop = img[mrz_y:h, 0:w]
+        
+        gray = cv2.cvtColor(mrz_crop, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced_gray = clahe.apply(gray)
+        
+        return cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+
+    @staticmethod
     def order_points(pts: np.ndarray) -> np.ndarray:
         """Order corner points as: top-left, top-right, bottom-right, bottom-left."""
         rect = np.zeros((4, 2), dtype="float32")
