@@ -67,3 +67,69 @@ def test_paddle_allocator_defaults_do_not_override_operator_settings(
         os.environ["FLAGS_reallocate_gpu_memory_in_mb"]
         == PADDLE_ALLOCATOR_DEFAULTS["FLAGS_reallocate_gpu_memory_in_mb"]
     )
+
+
+def test_configure_nvidia_libs_prepends_linux_ld_library_path(
+    monkeypatch, tmp_path
+) -> None:
+    import services.id_fin.detector as detector
+    from types import ModuleType
+
+    cudnn_lib = tmp_path / "cudnn" / "lib"
+    cublas_lib = tmp_path / "cublas" / "lib"
+    nvrtc_lib = tmp_path / "nvrtc" / "lib"
+    for path in (cudnn_lib, cublas_lib, nvrtc_lib):
+        path.mkdir(parents=True)
+
+    def fake_module(root: object) -> ModuleType:
+        module = ModuleType("fake_nvidia")
+        module.__path__ = [str(root)]  # type: ignore[attr-defined]
+        return module
+
+    roots = {
+        "nvidia.cudnn": tmp_path / "cudnn",
+        "nvidia.cublas": tmp_path / "cublas",
+        "nvidia.cuda_nvrtc": tmp_path / "nvrtc",
+    }
+
+    monkeypatch.setattr(detector, "_NVIDIA_LIBS_CONFIGURED", False)
+    monkeypatch.setattr(detector, "_DLL_DIRECTORY_HANDLES", [])
+    monkeypatch.setattr(detector, "_running_on_windows", lambda: False)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/already/present")
+
+    def fake_import(name: str):
+        if name not in roots:
+            raise ImportError(name)
+        return fake_module(roots[name])
+
+    monkeypatch.setattr(detector, "import_module", fake_import)
+
+    detector.configure_nvidia_dll_directories()
+
+    ld_path = os.environ["LD_LIBRARY_PATH"].split(os.pathsep)
+    assert str(cudnn_lib.resolve()) in ld_path
+    assert str(cublas_lib.resolve()) in ld_path
+    assert str(nvrtc_lib.resolve()) in ld_path
+    assert ld_path[-1] == "/already/present"
+    # Idempotent: second call must not duplicate entries.
+    before = os.environ["LD_LIBRARY_PATH"]
+    detector.configure_nvidia_dll_directories()
+    assert os.environ["LD_LIBRARY_PATH"] == before
+
+
+def test_configure_nvidia_libs_warns_when_packages_missing(monkeypatch) -> None:
+    import services.id_fin.detector as detector
+
+    monkeypatch.setattr(detector, "_NVIDIA_LIBS_CONFIGURED", False)
+    monkeypatch.setattr(detector, "_DLL_DIRECTORY_HANDLES", [])
+    monkeypatch.setattr(detector, "_running_on_windows", lambda: False)
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+
+    def missing_import(_name: str):
+        raise ImportError("missing")
+
+    monkeypatch.setattr(detector, "import_module", missing_import)
+    detector.configure_nvidia_dll_directories()
+    assert "LD_LIBRARY_PATH" not in os.environ
+

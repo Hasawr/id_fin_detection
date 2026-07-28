@@ -1,0 +1,27 @@
+[Unit]
+Description=OCR as Service FastAPI (ID FIN GPU)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aiadmin02
+Group=aiadmin02
+# Edit WorkingDirectory / EnvironmentFile / ExecStart paths to match the
+# project location on this host.
+WorkingDirectory=/home/aiadmin02/Desktop/OCRAsService/id_fin_detection-feture
+EnvironmentFile=/home/aiadmin02/Desktop/OCRAsService/id_fin_detection-feture/.env
+# Keep uvicorn workers at 1: OCR engines and GPU memory live in-process.
+ExecStart=/home/aiadmin02/Desktop/OCRAsService/id_fin_detection-feture/.venv-gpu/bin/python -m uvicorn api.main:app --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5
+# Give the GPU stack time to load models on first requests.
+TimeoutStopSec=60
+KillMode=mixed
+
+# Harden slightly; NVIDIA/CUDA still needs GPU device access.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

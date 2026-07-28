@@ -1,0 +1,31 @@
+# Linux GPU stack for NVIDIA RTX 50-series (Blackwell / sm_120), e.g. RTX 5090.
+# Keep the Windows laptop path on requirements.txt until this stack is validated.
+#
+# Install into a separate venv so the working CPU environment stays intact:
+#   python3 -m venv .venv-gpu && source .venv-gpu/bin/activate
+#   pip install -U pip setuptools
+#   pip install -r requirements-gpu-linux-5090.txt
+#   pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+#
+# If the China index times out, download the matching cp312 linux_x86_64 wheel
+# from https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/ and:
+#   pip install ./paddlepaddle_gpu-3.2.1-*-linux_x86_64.whl
+#
+# Then set USE_GPU=true and start uvicorn. Driver must support CUDA 12.9+.
+
+paddleocr==2.10.0
+nvidia-cudnn-cu12
+nvidia-cublas-cu12
+nvidia-cuda-nvrtc-cu12
+opencv-python-headless==4.11.0.86
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+pillow==12.3.0
+streamlit==1.59.2
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+python-multipart==0.0.32
+python-dotenv==1.2.2
+httpx==0.28.1
+setuptools>=69

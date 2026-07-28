@@ -54,8 +54,19 @@ class MRZExtractor:
     ) -> MRZResult:
         try:
             ocr_results = self.ocr.ocr(image, det=True, rec=True, cls=False)
-        except Exception:
-            logger.exception("PaddleOCR invocation failed in MRZExtractor")
+        except Exception as exc:
+            message = str(exc).lower()
+            if "cudnn" in message or "cuda" in message:
+                logger.exception(
+                    "PaddleOCR GPU/CUDA failure in MRZExtractor (%s). "
+                    "On Linux RTX 50-series install "
+                    "requirements-gpu-linux-5090.txt and ensure NVIDIA "
+                    "lib folders are on LD_LIBRARY_PATH, or set "
+                    "USE_GPU=false.",
+                    exc,
+                )
+            else:
+                logger.exception("PaddleOCR invocation failed in MRZExtractor")
             return self._not_found()
 
         if not ocr_results or not ocr_results[0]:

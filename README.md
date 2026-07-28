@@ -45,6 +45,72 @@ GPU acceleration is enabled by default with `USE_GPU=true`, and the project
 installs `paddlepaddle-gpu`. A compatible NVIDIA driver is required. The CLI
 also uses GPU by default; pass `--cpu` only for an explicit CPU run.
 
+### Linux GPU (RTX 50-series / Blackwell)
+
+Windows laptops (for example RTX 4060) keep using [`requirements.txt`](requirements.txt)
+with Paddle 2.6.2 and the `nvidia-*-cu11` pins. That stack does **not** target
+RTX 5090 (`sm_120`). On Linux RTX 50-series hosts:
+
+1. Use a separate venv so a working CPU install stays intact.
+2. Install [`requirements-gpu-linux-5090.txt`](requirements-gpu-linux-5090.txt).
+3. Install **Paddle GPU 3.2.1+** from the CUDA 12.9 index (driver must support
+   CUDA 12.9 or newer; `nvidia-smi` already showing CUDA 13.x is fine).
+4. Set `USE_GPU=true`. If GPU OCR still fails, set `USE_GPU=false` (CPU is
+   validated and accurate on this service).
+
+```bash
+python3 -m venv .venv-gpu
+source .venv-gpu/bin/activate
+pip install -U pip setuptools
+pip install -r requirements-gpu-linux-5090.txt
+pip install paddlepaddle-gpu==3.2.1 \
+  -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+# If that index times out, download the cp312 linux_x86_64 wheel from
+# https://paddle-whl.bj.bcebos.com/stable/cu129/paddlepaddle-gpu/ and:
+#   pip install ./paddlepaddle_gpu-3.2.1-*-linux_x86_64.whl
+
+bash scripts/validate_gpu_linux.sh
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8010
+```
+
+The detector prepends pip-installed NVIDIA `lib` folders to `LD_LIBRARY_PATH`
+on Linux before importing Paddle (Windows still uses `add_dll_directory`).
+
+### Linux production (systemd)
+
+On the RTX 5090 server, treat FastAPI as the production surface and keep
+Streamlit as a loopback-only demo. Do not bind the API to `0.0.0.0`, and do
+not reverse-proxy Streamlit publicly.
+
+1. Use `.venv-gpu` (Paddle 3.2.1 cu129). Never run production from the old
+   CPU/dev `.venv`.
+2. Copy [`.env.production.example`](.env.production.example) to `.env` and set
+   a real `API_KEYS` value.
+3. Install the systemd unit from [`deploy/ocr-api.service`](deploy/ocr-api.service)
+   (edit `WorkingDirectory` / paths if the project folder differs):
+
+```bash
+sudo cp deploy/ocr-api.service /etc/systemd/system/ocr-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ocr-api
+curl http://127.0.0.1:8010/health
+```
+
+Manual debug start (same venv, no systemd):
+
+```bash
+bash scripts/start_api_linux.sh
+```
+
+When a hostname and TLS certs exist, use
+[`deploy/nginx-ocr-fin.biletim.az.conf`](deploy/nginx-ocr-fin.biletim.az.conf)
+for **https://ocr-fin.biletim.az** (proxy to `127.0.0.1:8010`). A generic
+template remains in
+[`deploy/nginx-ocr-api.conf.example`](deploy/nginx-ocr-api.conf.example).
+Keep uvicorn workers at **1**. Do not expose Streamlit on the public subdomain.
+
+Quick server cheat-sheet: [`README simple.md`](README%20simple.md).
+
 For local use, start the API from the repository root. One OCR engine
 serializes inference on a background thread, so do not raise uvicorn
 `--workers` above 1:
@@ -167,6 +233,11 @@ demos/
 shared/audit.py         SQLite audit store for third-party API calls
 tests/                  Logic and HTTP contract tests
 benchmarks/             PII-safe local accuracy and GPU performance harness
+scripts/                Linux GPU validation and API start helpers
+deploy/                 systemd unit and nginx reverse-proxy examples
+requirements.txt        Windows / CUDA 11 oriented GPU pins
+requirements-gpu-linux-5090.txt  Linux RTX 50-series (cu129) GPU pins
+.env.production.example Production defaults for the 5090 Linux host
 ```
 
 The HTTP route handles transport and validation. Each package under

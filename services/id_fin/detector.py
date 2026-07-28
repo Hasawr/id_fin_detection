@@ -16,7 +16,13 @@ from .preprocessor import ImagePreprocessor
 
 logger = logging.getLogger(__name__)
 _DLL_DIRECTORY_HANDLES: list[object] = []
+_NVIDIA_LIBS_CONFIGURED = False
 PRODUCTION_OCR_VERSION = "PP-OCRv3"
+_NVIDIA_CUDA_MODULES = (
+    "nvidia.cudnn",
+    "nvidia.cublas",
+    "nvidia.cuda_nvrtc",
+)
 
 
 class OCRProcessingError(RuntimeError):
@@ -29,20 +35,65 @@ class OCRAttempt:
     image_factory: Callable[[], object | None]
 
 
+def _running_on_windows() -> bool:
+    return os.name == "nt"
+
+
+def _nvidia_package_lib_directories(module_name: str) -> list[str]:
+    """Return bin/lib folders shipped by a pip nvidia-* package, if present."""
+    module = import_module(module_name)
+    package_root = Path(next(iter(module.__path__)))
+    directories: list[str] = []
+    # Windows wheels keep shared libs under bin/; Linux wheels under lib/.
+    for subdir_name in ("bin", "lib"):
+        candidate = package_root / subdir_name
+        if candidate.is_dir():
+            directories.append(str(candidate.resolve()))
+    return directories
+
+
 def configure_nvidia_dll_directories() -> None:
-    """Expose pip-installed NVIDIA DLLs to Paddle on Windows."""
-    if os.name != "nt" or _DLL_DIRECTORY_HANDLES:
+    """Expose pip-installed NVIDIA CUDA libs to Paddle on Windows and Linux.
+
+    Windows uses ``os.add_dll_directory`` + ``PATH``. Linux prepends package
+    ``lib``/``bin`` folders to ``LD_LIBRARY_PATH`` before Paddle loads cuDNN.
+    """
+    global _NVIDIA_LIBS_CONFIGURED
+    if _NVIDIA_LIBS_CONFIGURED:
+        return
+    _NVIDIA_LIBS_CONFIGURED = True
+
+    directories: list[str] = []
+    for module_name in _NVIDIA_CUDA_MODULES:
+        try:
+            directories.extend(_nvidia_package_lib_directories(module_name))
+        except ImportError:
+            logger.warning(
+                "Optional NVIDIA package %s is not installed; "
+                "GPU OCR may fail to load cuDNN/CUDA shared libraries. "
+                "On Linux RTX 50-series hosts install the cu12 packages from "
+                "requirements-gpu-linux-5090.txt.",
+                module_name,
+            )
+
+    if not directories:
         return
 
-    bin_directories: list[str] = []
-    for module_name in ("nvidia.cudnn", "nvidia.cublas", "nvidia.cuda_nvrtc"):
-        module = import_module(module_name)
-        bin_directory = Path(next(iter(module.__path__))) / "bin"
-        bin_directories.append(str(bin_directory))
-        _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(str(bin_directory)))
+    if _running_on_windows():
+        for directory in directories:
+            _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(directory))
+        os.environ["PATH"] = os.pathsep.join(
+            [*directories, os.environ.get("PATH", "")]
+        )
+        return
 
-    os.environ["PATH"] = os.pathsep.join(
-        [*bin_directories, os.environ.get("PATH", "")]
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+        [*directories, *([existing] if existing else [])]
+    )
+    logger.info(
+        "Prepended NVIDIA library directories to LD_LIBRARY_PATH: %s",
+        directories,
     )
 
 
@@ -105,7 +156,10 @@ class FINDetector:
         if use_gpu and not paddle.device.is_compiled_with_cuda():
             raise RuntimeError(
                 "GPU mode requires the paddlepaddle-gpu package. "
-                "Reinstall dependencies from requirements.txt."
+                "On Windows use requirements.txt. On Linux RTX 50-series "
+                "(Blackwell) use requirements-gpu-linux-5090.txt with "
+                "paddlepaddle-gpu 3.2.1+ from the cu129 index. "
+                "Or set USE_GPU=false for CPU OCR."
             )
 
         logger.info(
@@ -117,19 +171,46 @@ class FINDetector:
         )
 
         def build_engine() -> "PaddleOCR":
-            return PaddleOCR(
-                use_angle_cls=False,
-                lang="en",
-                show_log=False,
-                use_gpu=use_gpu,
-                max_text_length=40,
-                det_limit_side_len=det_limit_side_len,
-                det_limit_type="max",
-                ocr_version=PRODUCTION_OCR_VERSION,
-            )
+            try:
+                return PaddleOCR(
+                    use_angle_cls=False,
+                    lang="en",
+                    show_log=False,
+                    use_gpu=use_gpu,
+                    max_text_length=40,
+                    det_limit_side_len=det_limit_side_len,
+                    det_limit_type="max",
+                    ocr_version=PRODUCTION_OCR_VERSION,
+                )
+            except Exception as exc:
+                if use_gpu:
+                    raise RuntimeError(
+                        "Failed to initialize PaddleOCR with GPU. "
+                        "Missing/incompatible CUDA or cuDNN is a common "
+                        "cause on Linux (especially RTX 50-series). "
+                        "Install requirements-gpu-linux-5090.txt, confirm "
+                        "LD_LIBRARY_PATH includes nvidia-* lib folders, or "
+                        "set USE_GPU=false. "
+                        f"Original error: {exc}"
+                    ) from exc
+                raise
 
         self.preprocessor = ImagePreprocessor()
-        self.mrz_extractor = MRZExtractor(build_engine())
+        try:
+            self.mrz_extractor = MRZExtractor(build_engine())
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            if use_gpu and (
+                "cudnn" in str(exc).lower() or "cuda" in str(exc).lower()
+            ):
+                raise RuntimeError(
+                    "GPU OCR backend failed during engine setup "
+                    f"({exc}). Set USE_GPU=false for CPU, or install the "
+                    "Linux RTX 50-series stack from "
+                    "requirements-gpu-linux-5090.txt."
+                ) from exc
+            raise
         # Extra engines let independent attempts within a single image run
         # concurrently instead of strictly one at a time. This trades some
         # redundant GPU/CPU compute (an attempt may still run even though an
