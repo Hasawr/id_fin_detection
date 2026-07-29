@@ -294,8 +294,8 @@ class AuditMiddleware(BaseHTTPMiddleware):
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
 
-    @staticmethod
-    def _extract_error_code(payload: Any) -> str | None:
+    @classmethod
+    def _extract_error_code(cls, payload: Any) -> str | None:
         if not isinstance(payload, dict):
             return None
 
@@ -304,10 +304,59 @@ class AuditMiddleware(BaseHTTPMiddleware):
             code = error.get("code")
             return str(code) if code is not None else None
 
+        return cls._format_reject_detail(payload, status_code=None)
+
+    @staticmethod
+    def _format_reject_detail(
+        payload: Any,
+        *,
+        status_code: int | None,
+    ) -> str | None:
+        """Keep a short, client-safe reject reason for the audit UI.
+
+        FIN/serial/MRZ values are never present on these error payloads. The
+        previous blanket "Request rejected." hid useful public messages such
+        as missing API key, wrong path, or validation failures.
+        """
+        if not isinstance(payload, dict):
+            return f"HTTP {status_code}" if status_code else None
+
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            if code and message:
+                return f"{code}: {message}"[:160]
+            if code is not None:
+                return str(code)[:160]
+            if message:
+                return str(message)[:160]
+
         detail = payload.get("detail")
-        if isinstance(detail, str):
-            return detail[:120]
-        return None
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()[:160]
+
+        if isinstance(detail, list):
+            parts: list[str] = []
+            for item in detail[:3]:
+                if isinstance(item, dict):
+                    msg = item.get("msg") or item.get("message") or item.get("type")
+                    loc = item.get("loc")
+                    field = None
+                    if isinstance(loc, (list, tuple)) and loc:
+                        field = ".".join(
+                            str(part) for part in loc if part != "body"
+                        )
+                    if msg and field:
+                        parts.append(f"{field}: {msg}")
+                    elif msg:
+                        parts.append(str(msg))
+                elif item is not None:
+                    parts.append(str(item)[:80])
+            if parts:
+                return ("Validation: " + "; ".join(parts))[:160]
+
+        return f"HTTP {status_code}" if status_code else None
 
     @classmethod
     def _sanitize_response(
@@ -324,10 +373,19 @@ class AuditMiddleware(BaseHTTPMiddleware):
         }
         error = payload.get("error")
         if isinstance(error, dict):
-            sanitized["error"] = {"code": error.get("code")}
+            reason = cls._format_reject_detail(payload, status_code=status_code)
+            sanitized["error"] = {
+                "code": error.get("code"),
+                "message": error.get("message"),
+            }
+            if reason:
+                sanitized["detail"] = reason
+            sanitized["status_code"] = status_code
             return sanitized
         if status_code >= 400:
-            sanitized["detail"] = "Request rejected."
+            reason = cls._format_reject_detail(payload, status_code=status_code)
+            sanitized["detail"] = reason or f"HTTP {status_code}"
+            sanitized["status_code"] = status_code
             return sanitized
 
         data = payload.get("data")

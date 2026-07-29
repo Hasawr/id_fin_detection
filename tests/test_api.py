@@ -312,6 +312,26 @@ def test_id_fin_rejects_invalid_api_key(client) -> None:
     assert len(events) == 1
     assert events[0].success is False
     assert events[0].status_code == 401
+    assert events[0].error_code == "Missing or invalid API key."
+    assert events[0].result_summary == "Missing or invalid API key."
+    assert events[0].response_body["detail"] == "Missing or invalid API key."
+
+
+def test_id_fin_rejects_missing_file_records_validation_reason(client) -> None:
+    test_client, store = client
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+    )
+    assert response.status_code == 422
+    events = store.recent_events(hours=None)
+    assert len(events) == 1
+    assert events[0].success is False
+    assert events[0].status_code == 422
+    assert events[0].error_code is not None
+    assert "Validation:" in events[0].error_code
+    assert "Validation:" in events[0].result_summary
+    assert events[0].response_body["detail"].startswith("Validation:")
 
 
 def test_id_fin_rejects_different_length_api_key(client) -> None:
