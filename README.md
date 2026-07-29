@@ -20,6 +20,11 @@ uploads are disabled by default; `AUDIT_STORE_PAYLOADS=true` enables bounded
 retention under `AUDIT_PAYLOAD_DIR`, controlled by `AUDIT_RETENTION_DAYS` and
 `AUDIT_MAX_PAYLOAD_BYTES`.
 
+For restricted troubleshooting environments, `AUDIT_STORE_PII=true` stores the
+actual FIN and card serial in the audit database so an operator can compare the
+OCR result with the retained upload. It defaults to `false`; MRZ lines remain
+excluded even when enabled.
+
 Open the Streamlit **Integration Audit** page to inspect volume, outcomes,
 saved payloads, and redacted response summaries.
 

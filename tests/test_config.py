@@ -46,6 +46,18 @@ def test_det_limit_side_len_is_read_and_bounded(monkeypatch) -> None:
     get_settings.cache_clear()
 
 
+def test_audit_store_pii_is_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("API_KEYS", "k" * 32)
+    monkeypatch.delenv("AUDIT_STORE_PII", raising=False)
+    get_settings.cache_clear()
+    assert get_settings().audit_store_pii is False
+
+    monkeypatch.setenv("AUDIT_STORE_PII", "true")
+    get_settings.cache_clear()
+    assert get_settings().audit_store_pii is True
+    get_settings.cache_clear()
+
+
 def test_paddle_allocator_defaults_do_not_override_operator_settings(
     monkeypatch,
 ) -> None:

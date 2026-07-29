@@ -107,6 +107,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         sanitized_response = self._sanitize_response(
             parsed_response,
             response.status_code,
+            store_pii=settings.audit_store_pii,
         )
 
         store = getattr(request.app.state, "audit_store", None) or get_audit_store()
@@ -363,6 +364,8 @@ class AuditMiddleware(BaseHTTPMiddleware):
         cls,
         payload: Any,
         status_code: int,
+        *,
+        store_pii: bool = False,
     ) -> Any:
         if not isinstance(payload, dict):
             return {"status_code": status_code}
@@ -392,7 +395,10 @@ class AuditMiddleware(BaseHTTPMiddleware):
         if not isinstance(data, dict):
             return sanitized
         if "fin" in data:
-            sanitized["data"] = cls._sanitize_detection(data)
+            sanitized["data"] = cls._sanitize_detection(
+                data,
+                store_pii=store_pii,
+            )
             return sanitized
 
         results = data.get("results")
@@ -400,7 +406,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             sanitized_results = [
                 {
                     "index": item.get("index"),
-                    **cls._sanitize_detection(item),
+                    **cls._sanitize_detection(item, store_pii=store_pii),
                 }
                 for item in results
                 if isinstance(item, dict)
@@ -412,7 +418,11 @@ class AuditMiddleware(BaseHTTPMiddleware):
         return sanitized
 
     @staticmethod
-    def _sanitize_detection(item: dict[str, Any]) -> dict[str, Any]:
+    def _sanitize_detection(
+        item: dict[str, Any],
+        *,
+        store_pii: bool = False,
+    ) -> dict[str, Any]:
         details = item.get("mrz_details")
         safe_details = None
         if isinstance(details, dict):
@@ -421,13 +431,21 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 "method": details.get("method"),
                 "checksum_valid": details.get("checksum_valid"),
                 "card_serial_number": (
-                    "[REDACTED]"
+                    details.get("card_serial_number")
+                    if store_pii
+                    else "[REDACTED]"
                     if details.get("card_serial_number")
                     else None
                 ),
             }
         return {
-            "fin": "[REDACTED]" if item.get("fin") else None,
+            "fin": (
+                item.get("fin")
+                if store_pii
+                else "[REDACTED]"
+                if item.get("fin")
+                else None
+            ),
             "confidence": item.get("confidence"),
             "mrz_details": safe_details,
         }

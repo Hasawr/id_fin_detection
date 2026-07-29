@@ -57,6 +57,7 @@ class Settings:
     audit_payload_dir: Path
     max_batch_bytes: int = 50 * 1024 * 1024
     audit_store_payloads: bool = False
+    audit_store_pii: bool = False
     audit_retention_days: int = 30
     audit_max_payload_bytes: int = 1024 * 1024 * 1024
     ocr_api_base_url: str = "http://127.0.0.1:8000"
@@ -117,6 +118,9 @@ def get_settings() -> Settings:
         ),
         audit_store_payloads=_as_bool(
             os.getenv("AUDIT_STORE_PAYLOADS"),
+        ),
+        audit_store_pii=_as_bool(
+            os.getenv("AUDIT_STORE_PII"),
         ),
         audit_retention_days=_bounded_int(
             "AUDIT_RETENTION_DAYS",

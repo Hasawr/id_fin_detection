@@ -169,6 +169,31 @@ def test_id_fin_accepts_authorized_upload(client) -> None:
     assert "SECRET-MRZ-LINE" not in str(event.response_body)
 
 
+def test_audit_can_store_fin_and_serial_when_explicitly_enabled(client) -> None:
+    test_client, store = client
+    app.state.settings = replace(
+        app.state.settings,
+        audit_store_pii=True,
+    )
+
+    response = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("id.png", VALID_PNG, "image/png")},
+    )
+
+    assert response.status_code == 200
+    event = store.recent_events(hours=None)[0]
+    assert event.response_body["data"]["fin"] == "7ABC123"
+    assert (
+        event.response_body["data"]["mrz_details"]["card_serial_number"]
+        == "AA1234567"
+    )
+    # Even in troubleshooting mode, full MRZ lines are unnecessary and must
+    # never be copied into the audit database.
+    assert "SECRET-MRZ-LINE" not in str(event.response_body)
+
+
 def test_id_fin_batch_accepts_multiple_uploads(client) -> None:
     test_client, store = client
     response = test_client.post(

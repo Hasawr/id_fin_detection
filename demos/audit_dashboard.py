@@ -25,7 +25,7 @@ from shared.config import get_settings
 
 
 AUDIT_SCHEMA_VERSION = 2
-PAGE_SIZE = 8
+PAGE_SIZE = 16
 RECEIVED_IMAGE_WIDTH_PX = 340
 EVENT_FETCH_LIMIT = 200
 LIVE_REFRESH_SECONDS = 12
@@ -321,29 +321,37 @@ def render_integration_audit() -> None:
     st.markdown(
         """
     <style>
-        .block-container { padding-top: 1.4rem; padding-bottom: 2.5rem; max-width: 1400px; }
+        /* Use the full window: the old 1400px cap left wide empty margins on
+           the monitors this page is actually watched on. */
+        .block-container {
+            padding-top: 1.1rem;
+            padding-bottom: 2rem;
+            padding-left: 1.6rem;
+            padding-right: 1.6rem;
+            max-width: 100%;
+        }
 
         .audit-kpis {
             display: grid;
             grid-template-columns: repeat(6, minmax(0, 1fr));
-            gap: 0.75rem;
-            margin: 0.25rem 0 1.1rem 0;
+            gap: 0.6rem;
+            margin: 0.25rem 0 0.8rem 0;
         }
         .audit-kpi {
             background: var(--secondary-background-color);
             border: 1px solid rgba(128, 128, 128, 0.18);
-            border-radius: 14px;
-            padding: 0.9rem 1rem;
+            border-radius: 12px;
+            padding: 0.6rem 0.8rem;
         }
         .audit-kpi .label {
-            font-size: 0.72rem;
+            font-size: 0.68rem;
             letter-spacing: 0.04em;
             text-transform: uppercase;
             opacity: 0.55;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.2rem;
         }
         .audit-kpi .value {
-            font-size: 1.55rem;
+            font-size: 1.3rem;
             font-weight: 650;
             line-height: 1.1;
             letter-spacing: -0.02em;
@@ -398,18 +406,57 @@ def render_integration_audit() -> None:
             border-radius: 14px !important;
         }
 
+        /* Compact call rows: each call is two tight lines instead of a card,
+           so a page shows roughly twice as many without scrolling. */
+        .st-key-audit_call_list div[data-testid="stVerticalBlockBorderWrapper"] {
+            padding: 0.3rem 0.55rem !important;
+            border-radius: 10px !important;
+            margin-bottom: 0.25rem;
+        }
+        .st-key-audit_call_list div[data-testid="stVerticalBlock"] {
+            gap: 0.1rem !important;
+        }
+        .st-key-audit_call_list [data-testid="stMarkdownContainer"] p {
+            margin-bottom: 0 !important;
+        }
+        .st-key-audit_call_list button {
+            padding: 0.1rem 0.4rem !important;
+            min-height: 1.8rem !important;
+            font-size: 0.78rem !important;
+        }
+        .call-row {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            flex-wrap: nowrap;
+        }
+        .call-row .call-id { font-weight: 650; font-size: 0.85rem; }
+        .call-row .call-meta {
+            font-size: 0.72rem;
+            opacity: 0.55;
+            margin-left: auto;
+            white-space: nowrap;
+        }
+        .call-summary {
+            font-size: 0.76rem;
+            opacity: 0.75;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
         .detail-hero {
             background: var(--secondary-background-color);
             border: 1px solid rgba(128, 128, 128, 0.18);
-            border-radius: 16px;
-            padding: 1rem 1.1rem;
-            margin-bottom: 0.75rem;
+            border-radius: 14px;
+            padding: 0.75rem 0.9rem;
+            margin-bottom: 0.55rem;
         }
         .detail-hero .title {
-            font-size: 1.15rem;
+            font-size: 1.05rem;
             font-weight: 650;
             letter-spacing: -0.02em;
-            margin-bottom: 0.35rem;
+            margin-bottom: 0.25rem;
         }
         .detail-hero .sub {
             font-size: 0.85rem;
@@ -418,14 +465,14 @@ def render_integration_audit() -> None:
         .kv-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 0.65rem;
-            margin: 0.75rem 0 0.25rem 0;
+            gap: 0.55rem;
+            margin: 0.55rem 0 0.25rem 0;
         }
         .kv {
             background: var(--secondary-background-color);
             border: 1px solid rgba(128, 128, 128, 0.18);
             border-radius: 12px;
-            padding: 0.7rem 0.8rem;
+            padding: 0.55rem 0.7rem;
         }
         .kv .k { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.5; }
         .kv .v { font-size: 1.05rem; font-weight: 650; margin-top: 0.2rem; word-break: break-word; }
@@ -484,6 +531,12 @@ def render_integration_audit() -> None:
     with clear_col:
         if st.button("Clear data", use_container_width=True):
             render_clear_all_dialog(store)
+
+    if settings.audit_store_pii:
+        st.caption(
+            "⚠ Sensitive audit mode is ON — new calls retain real FIN and "
+            "card serial values."
+        )
 
     run_every = timedelta(seconds=LIVE_REFRESH_SECONDS) if live else None
 
@@ -584,7 +637,7 @@ def render_integration_audit() -> None:
             return
 
         # --- Master / detail ---
-        list_col, detail_col = st.columns([1.05, 1.35], gap="large")
+        list_col, detail_col = st.columns([1, 1.5], gap="large")
 
         with list_col:
             start = page * PAGE_SIZE + 1
@@ -615,33 +668,39 @@ def render_integration_audit() -> None:
                         st.session_state["audit_list_page"] = page + 1
                         st.rerun()
 
-            for event in page_events:
-                badge = result_badge(event)
-                is_selected = event.id == selected_id
-                summary_text = call_list_summary(event)
-                client = client_label(event.api_key_fingerprint, labels)
-                when = format_when_short(event.created_at)
-                latency = int(round(event.latency_ms))
+            with st.container(key="audit_call_list"):
+                for event in page_events:
+                    badge = result_badge(event)
+                    is_selected = event.id == selected_id
+                    summary_text = call_list_summary(event)
+                    client = client_label(event.api_key_fingerprint, labels)
+                    when = format_when_short(event.created_at)
+                    latency = int(round(event.latency_ms))
 
-                with st.container(border=True):
-                    top_l, top_r = st.columns([3.4, 1.1])
-                    with top_l:
-                        st.markdown(
-                            f"**#{event.id}**&nbsp;&nbsp;{pill_html(badge)}",
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(summary_text)
-                        st.caption(f"{when} · {client} · {latency} ms")
-                    with top_r:
-                        if st.button(
-                            "Selected" if is_selected else "View",
-                            key=f"audit_open_{event.id}",
-                            use_container_width=True,
-                            type="primary" if is_selected else "secondary",
-                            disabled=is_selected,
-                        ):
-                            st.session_state["audit_selected_id"] = event.id
-                            st.rerun()
+                    with st.container(border=True):
+                        row_l, row_r = st.columns([4.6, 1], vertical_alignment="center")
+                        with row_l:
+                            st.markdown(
+                                f"<div class='call-row'>"
+                                f"<span class='call-id'>#{event.id}</span>"
+                                f"{pill_html(badge)}"
+                                f"<span class='call-meta'>{html.escape(when)} · "
+                                f"{html.escape(client)} · {latency} ms</span>"
+                                f"</div>"
+                                f"<div class='call-summary' title='{html.escape(summary_text)}'>"
+                                f"{html.escape(summary_text)}</div>",
+                                unsafe_allow_html=True,
+                            )
+                        with row_r:
+                            if st.button(
+                                "Open" if not is_selected else "Shown",
+                                key=f"audit_open_{event.id}",
+                                use_container_width=True,
+                                type="primary" if is_selected else "secondary",
+                                disabled=is_selected,
+                            ):
+                                st.session_state["audit_selected_id"] = event.id
+                                st.rerun()
 
         with detail_col:
             badge = result_badge(selected)
