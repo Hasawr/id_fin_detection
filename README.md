@@ -9,6 +9,7 @@ Passport OCR is registered as a placeholder for the next service.
 | Method | Route | API key | Status |
 | --- | --- | --- | --- |
 | `GET` | `/health` | No | Available |
+| `GET` | `/status` | No | Opt-in public sanitized status page |
 | `POST` | `/v1/id-fin` | Yes | Available |
 | `POST` | `/v1/id-fin/batch` | Yes | Multiple MRZ images |
 | `POST` | `/v1/passport` | Yes | Returns `501` until implemented |
@@ -24,6 +25,13 @@ For restricted troubleshooting environments, `AUDIT_STORE_PII=true` stores the
 actual FIN and card serial in the audit database so an operator can compare the
 OCR result with the retained upload. It defaults to `false`; MRZ lines remain
 excluded even when enabled.
+
+`PUBLIC_STATUS_ENABLED=true` serves a simple auto-refreshing HTML page at
+`/status` with health, aggregate rates, and recent sanitized outcomes
+(`Detected` / `FIN not found` / `Rejected`). It never shows FIN, serial, MRZ,
+uploaded images, filenames, client identity, or rejection reasons. Keep the
+detailed Streamlit Integration Audit internal; the public page only discloses
+that calls are happening and how often they succeed.
 
 Open the Streamlit **Integration Audit** page to inspect volume, outcomes,
 saved payloads, and redacted response summaries.

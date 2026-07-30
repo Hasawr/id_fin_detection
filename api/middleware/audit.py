@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 SKIP_PREFIXES = (
     "/health",
+    "/status",
     "/docs",
     "/redoc",
     "/openapi.json",

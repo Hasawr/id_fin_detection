@@ -60,6 +60,9 @@ class Settings:
     audit_store_pii: bool = False
     audit_retention_days: int = 30
     audit_max_payload_bytes: int = 1024 * 1024 * 1024
+    # Opt-in public HTML status page at /status. Disabled by default because
+    # it discloses aggregate traffic volume to anyone who can reach the API.
+    public_status_enabled: bool = False
     ocr_api_base_url: str = "http://127.0.0.1:8000"
     ocr_worker_count: int = 1
     ocr_concurrent_attempts: int = 1
@@ -133,6 +136,9 @@ def get_settings() -> Settings:
             1024 * 1024 * 1024,
             minimum=0,
             maximum=1024 * 1024 * 1024 * 1024,
+        ),
+        public_status_enabled=_as_bool(
+            os.getenv("PUBLIC_STATUS_ENABLED"),
         ),
         ocr_api_base_url=(
             os.getenv("OCR_API_BASE_URL")

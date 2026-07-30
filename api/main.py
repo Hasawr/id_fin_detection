@@ -2,11 +2,11 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, status as http_status
 from fastapi.responses import JSONResponse
 
 from api.middleware.audit import AuditMiddleware
-from api.routes import health, id_fin, passport
+from api.routes import health, id_fin, passport, status as status_page
 from api.schemas import ErrorDetail, IdFinResponse
 from services.id_fin.detector import OCRProcessingError
 from services.id_fin.service import get_id_fin_service
@@ -71,6 +71,13 @@ app = FastAPI(
             "name": "health",
             "description": "Service health checks.",
         },
+        {
+            "name": "status",
+            "description": (
+                "Public sanitized status page (disabled unless "
+                "PUBLIC_STATUS_ENABLED=true)."
+            ),
+        },
     ],
 )
 app.add_middleware(AuditMiddleware)
@@ -90,11 +97,12 @@ async def handle_ocr_processing_error(
         ),
     )
     return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
         content=response.model_dump(),
     )
 
 
 app.include_router(health.router)
+app.include_router(status_page.router)
 app.include_router(id_fin.router)
 app.include_router(passport.router)

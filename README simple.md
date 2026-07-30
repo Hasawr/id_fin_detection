@@ -53,13 +53,17 @@ Check:
 
 ```bash
 curl https://ocr-fin.biletim.az/health
+# optional public status page (set PUBLIC_STATUS_ENABLED=true in .env first):
+curl -I https://ocr-fin.biletim.az/status
 # with API key:
 curl -X POST "https://ocr-fin.biletim.az/v1/id-fin" \
   -H "X-API-Key: YOUR_KEY" \
   -F "mrz=@/path/to/id-back.jpg"
 ```
 
-Do **not** put Streamlit behind this subdomain.
+Do **not** put Streamlit behind this subdomain. The public `/status` page is
+safe HTML only (rates + sanitized outcomes). Keep the Streamlit Integration
+Audit on loopback.
 
 ## 3. Manual API start (debug only)
 

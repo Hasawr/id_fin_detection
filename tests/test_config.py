@@ -58,6 +58,18 @@ def test_audit_store_pii_is_opt_in(monkeypatch) -> None:
     get_settings.cache_clear()
 
 
+def test_public_status_enabled_is_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("API_KEYS", "k" * 32)
+    monkeypatch.delenv("PUBLIC_STATUS_ENABLED", raising=False)
+    get_settings.cache_clear()
+    assert get_settings().public_status_enabled is False
+
+    monkeypatch.setenv("PUBLIC_STATUS_ENABLED", "true")
+    get_settings.cache_clear()
+    assert get_settings().public_status_enabled is True
+    get_settings.cache_clear()
+
+
 def test_paddle_allocator_defaults_do_not_override_operator_settings(
     monkeypatch,
 ) -> None:

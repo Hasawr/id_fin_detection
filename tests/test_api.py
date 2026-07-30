@@ -655,3 +655,99 @@ def test_rejected_request_records_no_part_metadata(client) -> None:
     event = store.recent_events(hours=None)[0]
     assert event.request_files == []
     assert event.payload_dir is None
+
+
+def test_public_status_disabled_by_default(client) -> None:
+    test_client, _ = client
+    response = test_client.get("/status")
+    assert response.status_code == 404
+
+
+def test_public_status_page_is_sanitized_and_not_audited(client) -> None:
+    test_client, store = client
+    app.state.settings = replace(
+        app.state.settings,
+        public_status_enabled=True,
+        audit_store_pii=True,
+    )
+
+    detect = test_client.post(
+        "/v1/id-fin",
+        headers={"X-API-Key": TEST_API_KEY},
+        files={"mrz": ("secret-id.png", VALID_PNG, "image/png")},
+    )
+    assert detect.status_code == 200
+    before = store.summary(hours=None)["total"]
+
+    response = test_client.get("/status")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["referrer-policy"] == "no-referrer"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "noindex" in response.headers["x-robots-tag"]
+    assert "default-src 'none'" in response.headers["content-security-policy"]
+    assert 'http-equiv="refresh" content="15"' in response.text
+    assert "OCR API status" in response.text
+    assert "Detected" in response.text
+    assert "Last hour" in response.text
+    assert "Last 24 hours" in response.text
+
+    # Page refreshes must never create audit noise.
+    assert store.summary(hours=None)["total"] == before
+
+    # Even with PII retained in the audit DB, the public page must not leak it.
+    assert "7ABC123" not in response.text
+    assert "AA1234567" not in response.text
+    assert "SECRET-MRZ-LINE" not in response.text
+    assert "secret-id.png" not in response.text
+    assert "testclient" not in response.text.lower()
+    assert TEST_API_KEY not in response.text
+
+
+def test_public_recent_rows_allowlist_excludes_sensitive_fields() -> None:
+    from api.routes.status import public_outcome, public_recent_rows
+    from shared.audit import AuditEvent
+
+    event = AuditEvent(
+        id=9,
+        created_at="2026-07-29T10:00:00+00:00",
+        method="POST",
+        path="/v1/id-fin",
+        service="id-fin",
+        status_code=200,
+        success=True,
+        latency_ms=42.4,
+        api_key_fingerprint="abc123fingerprint",
+        error_code=None,
+        client_host="172.16.208.14",
+        user_agent="IntegrationClient/1.0",
+        request_content_type="multipart/form-data",
+        request_query="debug=1",
+        request_files=[{"file_name": "card.jpg", "field": "mrz"}],
+        response_body={
+            "data": {
+                "fin": "7ABC123",
+                "confidence": 0.99,
+                "mrz_details": {"card_serial_number": "AA1234567"},
+            }
+        },
+        result_summary="FIN 7ABC123 · Serial AA1234567 (0.99)",
+        payload_dir="audit_payloads/9",
+    )
+
+    assert public_outcome(event) == "Detected"
+    row = public_recent_rows([event])[0]
+    assert row == {
+        "created_at": "2026-07-29T10:00:00+00:00",
+        "endpoint": "POST /v1/id-fin",
+        "status_code": 200,
+        "latency_ms": 42,
+        "outcome": "Detected",
+    }
+    serialized = str(row)
+    assert "7ABC123" not in serialized
+    assert "AA1234567" not in serialized
+    assert "card.jpg" not in serialized
+    assert "172.16.208.14" not in serialized
+    assert "abc123fingerprint" not in serialized
