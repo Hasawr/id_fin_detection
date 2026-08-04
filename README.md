@@ -4,7 +4,7 @@ An automated OCR-based detection and extraction pipeline for Personal Identifica
 
 ---
 
-## 🚀 Features
+##  Features
 
 - **Dual Extraction Engine**:
   - **VIZ (Visual Inspection Zone / Front Side)**: Detects FIN codes located under personal data fields using ROI extraction and pattern matching.
@@ -15,7 +15,7 @@ An automated OCR-based detection and extraction pipeline for Personal Identifica
 
 ---
 
-## 🛠️ Project Structure
+##  Project Structure
 
 ```text
 id_fin_detection/
@@ -36,7 +36,7 @@ id_fin_detection/
 
 ---
 
-## 📦 Installation & Setup
+##  Installation & Setup
 
 1. **Clone the Repository**:
    ```bash
@@ -60,7 +60,7 @@ id_fin_detection/
 
 ---
 
-## 💻 Usage
+##  Usage
 
 ### 1. Streamlit Web App
 Launch the interactive web application in your browser:
@@ -88,7 +88,7 @@ Run detection directly from the command line:
 
 ---
 
-## 🛡️ Recommended Best Practices & Privacy
+##  Recommended Best Practices & Privacy
 
 - **Sensitive Data**: Avoid committing real ID cards or personal documents containing PII (Personally Identifiable Information) to public repositories.
 - **Debug Files**: Output files in `debug_output/` and `documents/` are ignored by `.gitignore` by default.
